@@ -134,6 +134,15 @@ def _validate_wan_model_id(value: str, field_name: str) -> str:
     raise ValueError(f"`{field_name}` must be `{WAN22_MODEL_ID}` or an explicit local path, got `{value}`.")
 
 
+def validate_fastwam_tiling(tiled: bool) -> None:
+    """Reject Wan2.2 VAE tiling before reaching diffusers' unsupported code path."""
+    if tiled:
+        raise ValueError(
+            "FastWAM does not support `tiled=True`: diffusers' AutoencoderKLWan tiled encoder "
+            "does not support the patchified Wan2.2 VAE (`patch_size=2`). Set `tiled=False`."
+        )
+
+
 def is_fastwam_base_compatible_config(config: FastWAMConfig) -> bool:
     """Return whether `fastwam_base` partial weights can initialize this config."""
 
@@ -205,6 +214,8 @@ class FastWAMConfig(PreTrainedConfig):
     text_cfg_scale: float = 1.0
     negative_prompt: str = ""
     sigma_shift: float | None = None
+    # Retained for configuration compatibility. True is rejected in __post_init__ because
+    # diffusers' AutoencoderKLWan tiled encoder does not support Wan2.2 patchification.
     tiled: bool = False
     fp32_attention: bool = True
     use_gradient_checkpointing: bool = False
@@ -235,6 +246,7 @@ class FastWAMConfig(PreTrainedConfig):
         super().__post_init__()
         self.image_size = tuple(self.image_size)
         self.model_id = _validate_wan_model_id(self.model_id, "model_id")
+        validate_fastwam_tiling(self.tiled)
         self.input_features = _coerce_policy_features(self.input_features)
         self.output_features = _coerce_policy_features(self.output_features)
         self.toggle_action_dimensions = [int(dim) for dim in self.toggle_action_dimensions]

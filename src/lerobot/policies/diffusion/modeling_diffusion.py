@@ -20,10 +20,8 @@ TODO(alexander-soare):
   - Remove reliance on diffusers for DDPMScheduler and LR scheduler.
 """
 
-import math
 from collections import deque
 from collections.abc import Callable
-from typing import TYPE_CHECKING
 
 import einops
 import numpy as np
@@ -33,15 +31,15 @@ import torchvision
 from torch import Tensor, nn
 
 from lerobot.utils.constants import ACTION, OBS_ENV_STATE, OBS_IMAGES, OBS_STATE
-from lerobot.utils.import_utils import _diffusers_available, require_package
+from lerobot.utils.import_utils import require_package
 
-if TYPE_CHECKING or _diffusers_available:
-    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-    from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-else:
-    DDIMScheduler = None
-    DDPMScheduler = None
-
+from ..common.diffusion_objective import (
+    compute_diffusion_loss,
+    make_inference_scheduler,
+    make_noise_scheduler,
+    run_conditional_sample,
+)
+from ..common.embeddings import SinusoidalPosEmb
 from ..pretrained import PreTrainedPolicy
 from ..utils import (
     get_device_from_parameters,
@@ -172,21 +170,6 @@ class DiffusionPolicy(PreTrainedPolicy):
         return loss, None
 
 
-def _make_noise_scheduler(name: str, **kwargs: dict):
-    """
-    Factory for noise scheduler instances of the requested type. All kwargs are passed
-    to the scheduler.
-    """
-    require_package("diffusers", extra="diffusion")
-
-    if name == "DDPM":
-        return DDPMScheduler(**kwargs)
-    elif name == "DDIM":
-        return DDIMScheduler(**kwargs)
-    else:
-        raise ValueError(f"Unsupported noise scheduler type {name}")
-
-
 class DiffusionModel(nn.Module):
     def __init__(self, config: DiffusionConfig):
         super().__init__()
@@ -213,7 +196,7 @@ class DiffusionModel(nn.Module):
             # common in diffusion inference.
             self.unet = torch.compile(self.unet, mode=config.compile_mode)
 
-        self.noise_scheduler = _make_noise_scheduler(
+        self.noise_scheduler = make_noise_scheduler(
             config.noise_scheduler_type,
             num_train_timesteps=config.num_train_timesteps,
             beta_start=config.beta_start,
@@ -222,6 +205,9 @@ class DiffusionModel(nn.Module):
             clip_sample=config.clip_sample,
             clip_sample_range=config.clip_sample_range,
             prediction_type=config.prediction_type,
+        )
+        self.inference_noise_scheduler = make_inference_scheduler(
+            self.noise_scheduler, config.inference_noise_scheduler_type
         )
 
         if config.num_inference_steps is None:
@@ -237,34 +223,16 @@ class DiffusionModel(nn.Module):
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
     ) -> Tensor:
-        device = get_device_from_parameters(self)
-        dtype = get_dtype_from_parameters(self)
-
-        # Sample prior.
-        sample = (
-            noise
-            if noise is not None
-            else torch.randn(
-                size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
-                dtype=dtype,
-                device=device,
-                generator=generator,
-            )
+        return run_conditional_sample(
+            lambda sample, timesteps: self.unet(sample, timesteps, global_cond=global_cond),
+            self.inference_noise_scheduler,
+            self.num_inference_steps,
+            shape=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
+            device=get_device_from_parameters(self),
+            dtype=get_dtype_from_parameters(self),
+            noise=noise,
+            generator=generator,
         )
-
-        self.noise_scheduler.set_timesteps(self.num_inference_steps)
-
-        for t in self.noise_scheduler.timesteps:
-            # Predict model output.
-            model_output = self.unet(
-                sample,
-                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
-                global_cond=global_cond,
-            )
-            # Compute previous image: x_t -> x_t-1
-            sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
-
-        return sample
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
@@ -356,34 +324,6 @@ class DiffusionModel(nn.Module):
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
-        # Forward diffusion.
-        trajectory = batch[ACTION]
-        # Sample noise to add to the trajectory.
-        eps = torch.randn(trajectory.shape, device=trajectory.device)
-        # Sample a random noising timestep for each item in the batch.
-        timesteps = torch.randint(
-            low=0,
-            high=self.noise_scheduler.config.num_train_timesteps,
-            size=(trajectory.shape[0],),
-            device=trajectory.device,
-        ).long()
-        # Add noise to the clean trajectories according to the noise magnitude at each timestep.
-        noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
-
-        # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
-
-        # Compute the loss.
-        # The target is either the original trajectory, or the noise.
-        if self.config.prediction_type == "epsilon":
-            target = eps
-        elif self.config.prediction_type == "sample":
-            target = batch[ACTION]
-        else:
-            raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
-
-        loss = F.mse_loss(pred, target, reduction="none")
-
         # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
         if self.config.do_mask_loss_for_padding:
             if "action_is_pad" not in batch:
@@ -391,12 +331,20 @@ class DiffusionModel(nn.Module):
                     "You need to provide 'action_is_pad' in the batch when "
                     f"{self.config.do_mask_loss_for_padding=}."
                 )
-            in_episode_bound = ~batch["action_is_pad"]
-            mask = in_episode_bound.unsqueeze(-1)
-            num_valid = mask.sum() * loss.shape[-1]
-            return (loss * mask).sum() / num_valid.clamp_min(1)
+            action_is_pad = batch["action_is_pad"]
+        else:
+            action_is_pad = None
 
-        return loss.mean()
+        return compute_diffusion_loss(
+            lambda noisy_trajectory, timesteps: self.unet(
+                noisy_trajectory, timesteps, global_cond=global_cond
+            ),
+            self.noise_scheduler,
+            batch[ACTION],
+            self.config.prediction_type,
+            action_is_pad=action_is_pad,
+            noise_like_trajectory=False,
+        )
 
 
 class SpatialSoftmax(nn.Module):
@@ -591,23 +539,6 @@ def _replace_submodules(
     return root_module
 
 
-class DiffusionSinusoidalPosEmb(nn.Module):
-    """1D sinusoidal positional embeddings as in Attention is All You Need."""
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x: Tensor) -> Tensor:
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x.unsqueeze(-1) * emb.unsqueeze(0)
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-
 class DiffusionConv1dBlock(nn.Module):
     """Conv1d --> GroupNorm --> Mish"""
 
@@ -637,7 +568,7 @@ class DiffusionConditionalUnet1d(nn.Module):
 
         # Encoder for the diffusion timestep.
         self.diffusion_step_encoder = nn.Sequential(
-            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
+            SinusoidalPosEmb(config.diffusion_step_embed_dim),
             nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
             nn.Mish(),
             nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),

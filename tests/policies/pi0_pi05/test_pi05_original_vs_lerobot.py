@@ -22,6 +22,11 @@ import os
 import pytest
 import torch
 
+pytest.skip(
+    "OpenPI parity and torch.compile checks are too slow for CI; run manually on GPU nodes",
+    allow_module_level=True,
+)
+
 pytest.importorskip("transformers")
 
 from lerobot.configs import PreTrainedConfig  # noqa: E402

@@ -84,13 +84,14 @@ class DiffusionConfig(PreTrainedConfig):
         beta_schedule: Name of the diffusion beta schedule as per DDPMScheduler from Hugging Face diffusers.
         beta_start: Beta value for the first forward-diffusion step.
         beta_end: Beta value for the last forward-diffusion step.
-        prediction_type: The type of prediction that the diffusion modeling Unet makes. Choose from "epsilon"
-            or "sample". These have equivalent outcomes from a latent variable modeling perspective, but
-            "epsilon" has been shown to work better in many deep neural network settings.
+        prediction_type: The type of prediction that the diffusion modeling Unet makes. Choose from
+            "epsilon", "sample", or "v_prediction".
         clip_sample: Whether to clip the sample to [-`clip_sample_range`, +`clip_sample_range`] for each
             denoising step at inference time. WARNING: you will need to make sure your action-space is
             normalized to fit within this range.
         clip_sample_range: The magnitude of the clipping range as described above.
+        inference_noise_scheduler_type: Optional DDPM/DDIM inference solver override. The solver is
+            constructed from the training scheduler config; None preserves the historical behavior.
         num_inference_steps: Number of reverse diffusion steps to use at inference time (steps are evenly
             spaced). If not provided, this defaults to be the same as `num_train_timesteps`.
         do_mask_loss_for_padding: Whether to mask the loss when there are copy-padded actions. See
@@ -143,6 +144,7 @@ class DiffusionConfig(PreTrainedConfig):
     clip_sample_range: float = 1.0
 
     # Inference
+    inference_noise_scheduler_type: str | None = None
     num_inference_steps: int | None = None
 
     # Optimization
@@ -169,7 +171,7 @@ class DiffusionConfig(PreTrainedConfig):
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
 
-        supported_prediction_types = ["epsilon", "sample"]
+        supported_prediction_types = ["epsilon", "sample", "v_prediction"]
         if self.prediction_type not in supported_prediction_types:
             raise ValueError(
                 f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
@@ -179,6 +181,14 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
                 f"Got {self.noise_scheduler_type}."
+            )
+        if (
+            self.inference_noise_scheduler_type is not None
+            and self.inference_noise_scheduler_type not in supported_noise_schedulers
+        ):
+            raise ValueError(
+                "`inference_noise_scheduler_type` must be None or one of "
+                f"{supported_noise_schedulers}. Got {self.inference_noise_scheduler_type}."
             )
 
         if self.resize_shape is not None and (

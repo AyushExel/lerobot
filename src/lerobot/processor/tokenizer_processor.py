@@ -41,6 +41,7 @@ from lerobot.utils.constants import (
 )
 from lerobot.utils.import_utils import _transformers_available
 
+from .fast_codec import fast_paligemma_token_offset
 from .pipeline import ActionProcessorStep, ObservationProcessorStep, ProcessorStepRegistry
 
 # Conditional import for type checking and lazy loading
@@ -424,12 +425,6 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
         new_transition[TransitionKey.COMPLEMENTARY_DATA] = complementary_data
         return new_transition
 
-    def _act_tokens_to_paligemma_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Converts action tokens to PaliGemma tokens.
-        """
-        return self._paligemma_tokenizer.vocab_size - 1 - self.fast_skip_tokens - tokens
-
     def _tokenize_action(self, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Tokenizes the action tensor and creates a mask.
@@ -442,6 +437,7 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
             - tokens: Tensor of token IDs with shape (B, max_action_tokens)
             - mask: Boolean mask with shape (B, max_action_tokens), True for real tokens, False for padding
         """
+
         if action is None:
             raise ValueError("Action cannot be None")
 
@@ -485,7 +481,11 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
                         self._paligemma_tokenizer.encode("Action: ", add_special_tokens=False),
                         device=action.device,
                     ),
-                    self._act_tokens_to_paligemma_tokens(tokens),
+                    fast_paligemma_token_offset(
+                        tokens,
+                        vocab_size=self._paligemma_tokenizer.vocab_size,
+                        fast_skip_tokens=self.fast_skip_tokens,
+                    ),
                     torch.tensor(self._paligemma_tokenizer.encode("|"), device=action.device),
                 ]
             )

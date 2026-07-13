@@ -25,7 +25,6 @@ References:
 - https://brysonkjones.substack.com/p/dissecting-and-open-sourcing-multitask-diffusion-transformer-policy
 """
 
-import math
 from collections import deque
 from typing import TYPE_CHECKING
 
@@ -36,7 +35,7 @@ import torch.nn.functional as F  # noqa: N812
 import torchvision
 from torch import Tensor
 
-from lerobot.utils.import_utils import _diffusers_available, _transformers_available, require_package
+from lerobot.utils.import_utils import _transformers_available, require_package
 
 from .configuration_multi_task_dit import MultiTaskDiTConfig
 
@@ -47,12 +46,6 @@ else:
     CLIPTextModel = None
     CLIPVisionModel = None
 
-if TYPE_CHECKING or _diffusers_available:
-    from diffusers.schedulers.scheduling_ddim import DDIMScheduler
-    from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
-else:
-    DDIMScheduler = None
-    DDPMScheduler = None
 from lerobot.utils.constants import (
     ACTION,
     OBS_IMAGES,
@@ -61,6 +54,13 @@ from lerobot.utils.constants import (
     OBS_STATE,
 )
 
+from ..common.diffusion_objective import (
+    compute_diffusion_loss,
+    make_inference_scheduler,
+    make_noise_scheduler,
+    run_conditional_sample,
+)
+from ..common.embeddings import SinusoidalPosEmb
 from ..pretrained import PreTrainedPolicy
 from ..utils import populate_queues
 
@@ -391,23 +391,6 @@ def modulate(x: Tensor, shift: Tensor, scale: Tensor) -> Tensor:
     return x * (1 + scale) + shift
 
 
-class SinusoidalPosEmb(nn.Module):
-    """Sinusoidal positional embeddings for timesteps."""
-
-    def __init__(self, dim: int):
-        super().__init__()
-        self.dim = dim
-
-    def forward(self, x: Tensor) -> Tensor:
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x[:, None] * emb[None, :]
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
-
-
 class RotaryPositionalEmbedding(nn.Module):
     """Rotary Position Embedding (RoPE) for transformers."""
 
@@ -642,22 +625,19 @@ class DiffusionObjective(nn.Module):
         self.horizon = horizon
         self.do_mask_loss_for_padding = do_mask_loss_for_padding
 
-        scheduler_kwargs = {
-            "num_train_timesteps": config.num_train_timesteps,
-            "beta_start": config.beta_start,
-            "beta_end": config.beta_end,
-            "beta_schedule": config.beta_schedule,
-            "clip_sample": config.clip_sample,
-            "clip_sample_range": config.clip_sample_range,
-            "prediction_type": config.prediction_type,
-        }
-
-        if config.noise_scheduler_type == "DDPM":
-            self.noise_scheduler: DDPMScheduler | DDIMScheduler = DDPMScheduler(**scheduler_kwargs)
-        elif config.noise_scheduler_type == "DDIM":
-            self.noise_scheduler = DDIMScheduler(**scheduler_kwargs)
-        else:
-            raise ValueError(f"Unsupported noise scheduler type {config.noise_scheduler_type}")
+        self.noise_scheduler = make_noise_scheduler(
+            config.noise_scheduler_type,
+            num_train_timesteps=config.num_train_timesteps,
+            beta_start=config.beta_start,
+            beta_end=config.beta_end,
+            beta_schedule=config.beta_schedule,
+            clip_sample=config.clip_sample,
+            clip_sample_range=config.clip_sample_range,
+            prediction_type=config.prediction_type,
+        )
+        self.inference_noise_scheduler = make_inference_scheduler(
+            self.noise_scheduler, config.inference_noise_scheduler_type
+        )
 
         self.num_inference_steps = (
             config.num_inference_steps
@@ -666,54 +646,28 @@ class DiffusionObjective(nn.Module):
         )
 
     def compute_loss(self, model: nn.Module, batch: dict[str, Tensor], conditioning_vec: Tensor) -> Tensor:
-        clean_actions = batch[ACTION]
-        noise = torch.randn_like(clean_actions)
-        timesteps = torch.randint(
-            low=0,
-            high=self.noise_scheduler.config.num_train_timesteps,
-            size=(clean_actions.shape[0],),
-            device=clean_actions.device,
-        ).long()
-        noisy_actions = self.noise_scheduler.add_noise(clean_actions, noise, timesteps)
-
-        prediction_type = self.noise_scheduler.config.prediction_type
-        if prediction_type == "epsilon":
-            target = noise
-        elif prediction_type == "sample":
-            target = clean_actions
-        else:
-            raise ValueError(f"Unsupported prediction type: {prediction_type}")
-
-        predicted = model(noisy_actions, timesteps, conditioning_vec=conditioning_vec)
-        loss = F.mse_loss(predicted, target, reduction="none")
-
-        if self.do_mask_loss_for_padding and "action_is_pad" in batch:
-            mask = ~batch["action_is_pad"].unsqueeze(-1)
-            num_valid = mask.sum() * loss.shape[-1]
-            return (loss * mask).sum() / num_valid.clamp_min(1)
-
-        return loss.mean()
-
-    def conditional_sample(self, model: nn.Module, batch_size: int, conditioning_vec: Tensor) -> Tensor:
-        device = next(model.parameters()).device
-        dtype = next(model.parameters()).dtype
-
-        sample = torch.randn(
-            size=(batch_size, self.horizon, self.action_dim),
-            dtype=dtype,
-            device=device,
+        action_is_pad = (
+            batch["action_is_pad"] if self.do_mask_loss_for_padding and "action_is_pad" in batch else None
+        )
+        return compute_diffusion_loss(
+            lambda noisy_actions, timesteps: model(
+                noisy_actions, timesteps, conditioning_vec=conditioning_vec
+            ),
+            self.noise_scheduler,
+            batch[ACTION],
+            self.noise_scheduler.config.prediction_type,
+            action_is_pad=action_is_pad,
         )
 
-        self.noise_scheduler.set_timesteps(self.num_inference_steps)
-        for t in self.noise_scheduler.timesteps:
-            model_output = model(
-                sample,
-                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
-                conditioning_vec=conditioning_vec,
-            )
-            sample = self.noise_scheduler.step(model_output, t, sample).prev_sample
-
-        return sample
+    def conditional_sample(self, model: nn.Module, batch_size: int, conditioning_vec: Tensor) -> Tensor:
+        return run_conditional_sample(
+            lambda sample, timesteps: model(sample, timesteps, conditioning_vec=conditioning_vec),
+            self.inference_noise_scheduler,
+            self.num_inference_steps,
+            shape=(batch_size, self.horizon, self.action_dim),
+            device=next(model.parameters()).device,
+            dtype=next(model.parameters()).dtype,
+        )
 
 
 class FlowMatchingObjective(nn.Module):

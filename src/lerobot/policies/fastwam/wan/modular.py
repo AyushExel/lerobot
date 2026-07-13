@@ -24,6 +24,11 @@ import torch.nn as nn
 import torch.nn.functional as functional
 from PIL import Image
 
+from lerobot.policies.common.wan_flow_scheduler import (
+    WanContinuousFlowMatchScheduler,
+    WanDiffusersFlowMatchInferenceScheduler,
+)
+
 from .components import (
     WAN22_DIFFUSERS_MODEL_ID,
     WAN_T5_TOKENIZER,
@@ -35,7 +40,6 @@ from .components import (
 )
 from .video_dit import (
     FastWAMAttentionBlock,
-    WanContinuousFlowMatchScheduler,
     fastwam_masked_attention,
     gradient_checkpoint_forward,
     modulate,
@@ -891,7 +895,7 @@ class FastWAM(torch.nn.Module):
             num_train_timesteps=video_num_train_timesteps,
             shift=video_train_shift,
         )
-        self.infer_video_scheduler = WanContinuousFlowMatchScheduler(
+        self.infer_video_scheduler = WanDiffusersFlowMatchInferenceScheduler(
             num_train_timesteps=video_num_train_timesteps,
             shift=video_infer_shift,
         )
@@ -899,7 +903,7 @@ class FastWAM(torch.nn.Module):
             num_train_timesteps=action_num_train_timesteps,
             shift=action_train_shift,
         )
-        self.infer_action_scheduler = WanContinuousFlowMatchScheduler(
+        self.infer_action_scheduler = WanDiffusersFlowMatchInferenceScheduler(
             num_train_timesteps=action_num_train_timesteps,
             shift=action_infer_shift,
         )
@@ -1732,23 +1736,21 @@ class FastWAM(torch.nn.Module):
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
         context, context_mask = self._prepare_infer_context(prompt, context, context_mask, proprio)
 
-        infer_timesteps_video, infer_deltas_video = self.infer_video_scheduler.build_inference_schedule(
+        infer_timesteps_video = self.infer_video_scheduler.set_timesteps(
             num_inference_steps=num_inference_steps,
             device=self.device,
             dtype=latents_video.dtype,
             shift_override=sigma_shift,
         )
-        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+        infer_timesteps_action = self.infer_action_scheduler.set_timesteps(
             num_inference_steps=num_inference_steps,
             device=self.device,
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
-        for step_t_video, step_delta_video, step_t_action, step_delta_action in zip(
+        for step_t_video, step_t_action in zip(
             infer_timesteps_video,
-            infer_deltas_video,
             infer_timesteps_action,
-            infer_deltas_action,
             strict=True,
         ):
             timestep_video = step_t_video.unsqueeze(0).to(dtype=latents_video.dtype, device=self.device)
@@ -1765,8 +1767,8 @@ class FastWAM(torch.nn.Module):
                 gt_action=action,
             )
 
-            latents_video = self.infer_video_scheduler.step(pred_video, step_delta_video, latents_video)
-            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+            latents_video = self.infer_video_scheduler.step(pred_video, latents_video)
+            latents_action = self.infer_action_scheduler.step(pred_action, latents_action)
             latents_video[:, :, 0:1] = first_frame_latents.clone()
 
         action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
@@ -1845,13 +1847,13 @@ class FastWAM(torch.nn.Module):
             video_attention_mask=attention_mask[:video_seq_len, :video_seq_len],
         )
 
-        infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
+        infer_timesteps_action = self.infer_action_scheduler.set_timesteps(
             num_inference_steps=num_inference_steps,
             device=self.device,
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
-        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action, strict=True):
+        for step_t_action in infer_timesteps_action:
             timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
             pred_action = self._predict_action_noise_with_cache(
@@ -1864,7 +1866,7 @@ class FastWAM(torch.nn.Module):
                 video_seq_len=video_seq_len,
             )
 
-            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+            latents_action = self.infer_action_scheduler.step(pred_action, latents_action)
 
         return {
             "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),

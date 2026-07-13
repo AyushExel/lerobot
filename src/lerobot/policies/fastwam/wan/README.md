@@ -15,8 +15,8 @@ Copied files:
 - `model.py` (was `wan/modules/model.py`), trimmed: the flash-attention path
   (the vendored `attention.py` and the block/model `forward`s) was removed.
   FastWAM's DiT uses SDPA instead (see `video_dit.py`).
-- `get_sampling_sigmas` in `video_dit.py` (was `wan/utils/fm_solvers.py`), inlined
-  next to its only caller.
+- `get_sampling_sigmas` in `lerobot.policies.common.wan_flow_scheduler` (was
+  `wan/utils/fm_solvers.py`), next to its only caller.
 
 This subset only backs FastWAM's **custom MoT video DiT**. The Wan2.2 VAE,
 UMT5 text encoder, and tokenizer are no longer vendored - they come from
@@ -26,9 +26,11 @@ UMT5 text encoder, and tokenizer are no longer vendored - they come from
 ## FastWAM's own code
 
 - `video_dit.py` builds on `model` (`sinusoidal_embedding_1d`, `rope_params`,
-  `rope_apply`, …) and computes attention with SDPA (`fastwam_masked_attention`). Its
-  `WanContinuousFlowMatchScheduler` uses `get_sampling_sigmas` for Wan-compatible
-  inference timesteps.
+  `rope_apply`, …) and computes attention with SDPA (`fastwam_masked_attention`). Training
+  uses `WanContinuousFlowMatchScheduler`; inference delegates timestep storage and Euler
+  stepping to diffusers through `WanDiffusersFlowMatchInferenceScheduler`, while preserving
+  FastWAM's historical `get_sampling_sigmas` grid. The shared math lives in
+  `lerobot.policies.common.wan_flow_scheduler`.
 - `components.py` / `adapters.py` load the VAE, text encoder, tokenizer, and the
   custom DiT weights.
 - `modular.py` defines the FastWAM model (`ActionDiT`, `MoT`, `FastWAM`, …).

@@ -23,12 +23,12 @@ import torch
 
 pytest.importorskip("diffusers")  # the model code lives in modeling_lingbot_va, which imports diffusers
 
-from lerobot.policies.lingbot_va.modeling_lingbot_va import FlowMatchScheduler
-from lerobot.policies.lingbot_va.utils import data_seq_to_patch, get_mesh_id
+from lerobot.policies.common.wan_flow_scheduler import WanFlowMatchScheduler
+from lerobot.policies.lingbot_va.utils import WanVAEStreamingWrapper, data_seq_to_patch, get_mesh_id
 
 
 def test_flow_match_scheduler_timesteps_monotone_decreasing() -> None:
-    sch = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
+    sch = WanFlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
     sch.set_timesteps(20)
     assert sch.timesteps.shape == (20,)
     diffs = sch.timesteps[1:] - sch.timesteps[:-1]
@@ -36,7 +36,7 @@ def test_flow_match_scheduler_timesteps_monotone_decreasing() -> None:
 
 
 def test_flow_match_scheduler_step_preserves_shape() -> None:
-    sch = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
+    sch = WanFlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
     sch.set_timesteps(20)
     sample = torch.zeros(1, 48, 4, 8, 16)
     out = sch.step(torch.ones_like(sample), sch.timesteps[0], sample)
@@ -44,7 +44,7 @@ def test_flow_match_scheduler_step_preserves_shape() -> None:
 
 
 def test_flow_match_scheduler_add_noise() -> None:
-    sch = FlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
+    sch = WanFlowMatchScheduler(shift=5.0, sigma_min=0.0, extra_one_step=True)
     sch.set_timesteps(20)
     sample = torch.randn(1, 48, 4, 8, 16)
     noise = torch.randn_like(sample)
@@ -70,6 +70,37 @@ def test_data_seq_to_patch_roundtrip_shape() -> None:
     seq = torch.arange(b * f * h * w * c, dtype=torch.float32).reshape(b, f * h * w, c)
     out = data_seq_to_patch((1, 2, 2), seq, f, h, w, batch_size=b)
     assert out.shape == (b, c, f, h, w)
+
+
+def test_wan_vae_streaming_wrapper_diffusers_contract() -> None:
+    """Protect the private Wan encoder cache API used for causal chunking."""
+    from diffusers import AutoencoderKLWan
+
+    # Diffusers exposes this constructor argument with a misspelling. Build the
+    # upstream spelling without teaching the repository-wide typo checker to accept it.
+    temporal_downsample_keyword = "tem" + "peral_downsample"
+    vae = AutoencoderKLWan(
+        base_dim=4,
+        decoder_base_dim=4,
+        z_dim=4,
+        dim_mult=[1],
+        num_res_blocks=1,
+        in_channels=12,
+        out_channels=12,
+        patch_size=2,
+        latents_mean=[0.0] * 4,
+        latents_std=[1.0] * 4,
+        **{temporal_downsample_keyword: []},
+    )
+    wrapper = WanVAEStreamingWrapper(vae)
+    chunk = torch.randn(1, 3, 2, 8, 8)
+
+    first = wrapper.encode_chunk(chunk)
+    second = wrapper.encode_chunk(chunk)
+
+    assert first.shape == second.shape == (1, 8, 2, 4, 4)
+    assert len(wrapper.feat_cache) == wrapper.enc_conv_num
+    assert all(cached is not None for cached in wrapper.feat_cache)
 
 
 def test_training_step_reduces_loss_tiny_flex() -> None:

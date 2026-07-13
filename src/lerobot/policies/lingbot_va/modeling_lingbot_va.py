@@ -38,13 +38,13 @@ import torch.nn.functional as F  # noqa: N812
 from einops import rearrange
 from torch import Tensor
 
+from lerobot.policies.common.wan_flow_scheduler import WanFlowMatchScheduler
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import ACTION
 from lerobot.utils.import_utils import require_package
 
 from .configuration_lingbot_va import LingBotVAConfig
 from .utils import (
-    FlowMatchScheduler,
     WanTransformer3DModel,
     WanVAEStreamingWrapper,
     _sample_timestep_id,
@@ -174,8 +174,8 @@ class LingBotVAPolicy(PreTrainedPolicy):
         self.last_predicted_latents = None
         self._use_cfg = (cfg.guidance_scale > 1) or (cfg.action_guidance_scale > 1)
         # Two independent flow-matching schedulers (video latent + action streams).
-        self._scheduler = FlowMatchScheduler(shift=cfg.snr_shift, sigma_min=0.0, extra_one_step=True)
-        self._action_scheduler = FlowMatchScheduler(
+        self._scheduler = WanFlowMatchScheduler(shift=cfg.snr_shift, sigma_min=0.0, extra_one_step=True)
+        self._action_scheduler = WanFlowMatchScheduler(
             shift=cfg.action_snr_shift, sigma_min=0.0, extra_one_step=True
         )
         self._scheduler.set_timesteps(1000, training=True)
@@ -196,11 +196,11 @@ class LingBotVAPolicy(PreTrainedPolicy):
     def _ensure_train_schedulers(self):
         if getattr(self, "_train_sched_latent", None) is None:
             cfg = self.config
-            self._train_sched_latent = FlowMatchScheduler(
+            self._train_sched_latent = WanFlowMatchScheduler(
                 shift=cfg.snr_shift, sigma_min=0.0, extra_one_step=True
             )
             self._train_sched_latent.set_timesteps(1000, training=True)
-            self._train_sched_action = FlowMatchScheduler(
+            self._train_sched_action = WanFlowMatchScheduler(
                 shift=cfg.action_snr_shift, sigma_min=0.0, extra_one_step=True
             )
             self._train_sched_action.set_timesteps(1000, training=True)

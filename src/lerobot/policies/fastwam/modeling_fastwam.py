@@ -25,7 +25,7 @@ from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.utils.constants import OBS_STATE
 from lerobot.utils.import_utils import require_package
 
-from .configuration_fastwam import FastWAMConfig
+from .configuration_fastwam import FastWAMConfig, validate_fastwam_tiling
 from .wan import (
     ActionDiT,
     FastWAM,
@@ -297,6 +297,8 @@ def _scalar(value: Any) -> Any:
 
 
 def _batch_to_infer_kwargs(batch: dict[str, Tensor], config: FastWAMConfig) -> dict[str, Any]:
+    tiled = bool(batch.get("tiled", config.tiled))
+    validate_fastwam_tiling(tiled)
     return {
         "prompt": _prompt_from_batch(batch=batch, config=config),
         "input_image": _input_image_from_batch(batch, config),
@@ -310,7 +312,7 @@ def _batch_to_infer_kwargs(batch: dict[str, Tensor], config: FastWAMConfig) -> d
         "sigma_shift": batch.get("sigma_shift", config.sigma_shift),
         "seed": batch.get("seed", config.inference_seed),
         "rand_device": batch.get("rand_device", config.rand_device),
-        "tiled": bool(batch.get("tiled", config.tiled)),
+        "tiled": tiled,
     }
 
 

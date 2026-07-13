@@ -16,30 +16,14 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
 from torch.distributions import Beta
 
-from lerobot.utils.import_utils import _diffusers_available, require_package
-
-if TYPE_CHECKING or _diffusers_available:
-    from diffusers import ConfigMixin, ModelMixin
-    from diffusers.configuration_utils import register_to_config
-    from diffusers.models.attention import Attention, FeedForward
-    from diffusers.models.embeddings import TimestepEmbedding, Timesteps
-else:
-
-    class ModelMixin:  # type: ignore[no-redef]
-        pass
-
-    class ConfigMixin:  # type: ignore[no-redef]
-        pass
-
-    register_to_config = lambda f: f  # noqa: E731
-    Attention = FeedForward = TimestepEmbedding = Timesteps = None
+from lerobot.policies.common.heads.cross_attention_dit import DiT
+from lerobot.utils.import_utils import require_package
 
 from .configuration_vla_jepa import VLAJEPAConfig
 
@@ -77,116 +61,6 @@ class ActionEncoder(nn.Module):
         return self.layer3(F.silu(self.layer2(torch.cat([action_emb, time_emb], dim=-1))))
 
 
-class TimestepEncoder(nn.Module):
-    def __init__(self, embedding_dim: int):
-        super().__init__()
-        require_package("diffusers", extra="vla_jepa")
-        self.time_proj = Timesteps(num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=1)
-        self.timestep_embedder = TimestepEmbedding(in_channels=256, time_embed_dim=embedding_dim)
-
-    def forward(self, timesteps: torch.Tensor) -> torch.Tensor:
-        projected = self.time_proj(timesteps).to(dtype=next(self.parameters()).dtype)
-        return self.timestep_embedder(projected)
-
-
-class AdaLayerNorm(nn.Module):
-    def __init__(self, embedding_dim: int):
-        super().__init__()
-        self.linear = nn.Linear(embedding_dim, embedding_dim * 2)
-        self.norm = nn.LayerNorm(embedding_dim, eps=1e-5, elementwise_affine=False)
-        self.silu = nn.SiLU()
-
-    def forward(self, x: torch.Tensor, temb: torch.Tensor) -> torch.Tensor:
-        scale, shift = self.linear(self.silu(temb)).chunk(2, dim=-1)
-        return self.norm(x) * (1 + scale[:, None]) + shift[:, None]
-
-
-class BasicTransformerBlock(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_attention_heads: int,
-        attention_head_dim: int,
-        dropout: float,
-        cross_attention_dim: int,
-        is_cross_attention: bool = True,
-    ) -> None:
-        super().__init__()
-        self.is_cross_attention = is_cross_attention
-        self.norm1 = AdaLayerNorm(dim)
-        self.attn1 = Attention(
-            query_dim=dim,
-            heads=num_attention_heads,
-            dim_head=attention_head_dim,
-            dropout=dropout,
-            bias=True,
-            cross_attention_dim=cross_attention_dim,
-            out_bias=True,
-        )
-        self.norm2 = nn.LayerNorm(dim, eps=1e-5, elementwise_affine=False)
-        self.ff = FeedForward(dim, dropout=dropout, activation_fn="gelu-approximate", final_dropout=True)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor | None,
-        temb: torch.Tensor,
-    ) -> torch.Tensor:
-        attn_input = self.norm1(hidden_states, temb)
-        attention_context = encoder_hidden_states if self.is_cross_attention else None
-        hidden_states = hidden_states + self.attn1(attn_input, encoder_hidden_states=attention_context)
-        hidden_states = hidden_states + self.ff(self.norm2(hidden_states))
-        return hidden_states
-
-
-class DiT(ModelMixin, ConfigMixin):
-    _supports_gradient_checkpointing = False
-
-    @register_to_config
-    def __init__(
-        self,
-        num_attention_heads: int,
-        attention_head_dim: int,
-        output_dim: int,
-        num_layers: int,
-        dropout: float,
-        cross_attention_dim: int,
-    ) -> None:
-        super().__init__()
-        self.inner_dim = num_attention_heads * attention_head_dim
-        self.timestep_encoder = TimestepEncoder(self.inner_dim)
-        self.transformer_blocks = nn.ModuleList(
-            [
-                BasicTransformerBlock(
-                    dim=self.inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
-                    dropout=dropout,
-                    cross_attention_dim=cross_attention_dim if layer_idx % 2 == 0 else self.inner_dim,
-                    is_cross_attention=layer_idx % 2 == 0,
-                )
-                for layer_idx in range(num_layers)
-            ]
-        )
-        self.norm_out = nn.LayerNorm(self.inner_dim, eps=1e-6, elementwise_affine=False)
-        self.proj_out_1 = nn.Linear(self.inner_dim, self.inner_dim * 2)
-        self.proj_out_2 = nn.Linear(self.inner_dim, output_dim)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        encoder_hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
-    ) -> torch.Tensor:
-        temb = self.timestep_encoder(timestep)
-        x = hidden_states
-        for block in self.transformer_blocks:
-            x = block(x, encoder_hidden_states=encoder_hidden_states, temb=temb)
-        shift, scale = self.proj_out_1(F.silu(temb)).chunk(2, dim=-1)
-        x = self.norm_out(x) * (1 + scale[:, None]) + shift[:, None]
-        return self.proj_out_2(x)
-
-
 @dataclass
 class ActionModelPreset:
     hidden_size: int
@@ -203,6 +77,7 @@ DIT_PRESETS = {
 
 class VLAJEPAActionHead(nn.Module):
     def __init__(self, config: VLAJEPAConfig, cross_attention_dim: int) -> None:
+        require_package("diffusers", extra="vla_jepa")
         super().__init__()
         preset = DIT_PRESETS[config.action_model_type]
         self.config = config
@@ -215,6 +90,9 @@ class VLAJEPAActionHead(nn.Module):
         self.num_inference_timesteps = config.num_inference_timesteps
 
         hidden_size = config.action_hidden_size
+        # Pin the shared DiT to VLA-JEPA's historical architecture: ada_norm blocks that
+        # alternate cross- and self-attention, no positional embeddings, feed-forward
+        # final dropout but no extra dropout on the attention output.
         self.model = DiT(
             num_attention_heads=num_heads,
             attention_head_dim=head_dim,
@@ -222,6 +100,13 @@ class VLAJEPAActionHead(nn.Module):
             num_layers=config.action_num_layers,
             dropout=config.action_dropout,
             cross_attention_dim=cross_attention_dim,
+            attention_bias=True,
+            activation_fn="gelu-approximate",
+            norm_type="ada_norm",
+            final_dropout=True,
+            positional_embeddings=None,
+            interleave_self_attention=True,
+            attn_output_dropout=False,
         )
         self.action_encoder = ActionEncoder(config.action_dim, inner_dim)
         self.action_decoder = nn.Sequential(

@@ -121,6 +121,8 @@ def test_n1_7_backbone_accepts_transformers_5_layout_and_forwards_mm_token_type_
             self.language_model = FakeLanguageModel()
             self.visual = nn.Linear(1, 1)
 
+    loading_kwargs: list[dict] = []
+
     class FakeQwen3VLForConditionalGeneration(nn.Module):
         config = SimpleNamespace(image_token_id=42, video_token_id=43)
 
@@ -131,6 +133,7 @@ def test_n1_7_backbone_accepts_transformers_5_layout_and_forwards_mm_token_type_
 
         @classmethod
         def from_pretrained(cls, *args, **kwargs):
+            loading_kwargs.append(kwargs)
             return cls()
 
         @classmethod
@@ -157,13 +160,15 @@ def test_n1_7_backbone_accepts_transformers_5_layout_and_forwards_mm_token_type_
         raising=False,
     )
     monkeypatch.setattr(groot_n1_7, "Qwen3VLForConditionalGeneration", FakeQwen3VLForConditionalGeneration)
+    monkeypatch.setattr(groot_n1_7, "is_flash_attn_2_available", lambda: True)
 
     backbone = groot_n1_7.Qwen3Backbone(
         model_name="nvidia/Cosmos-Reason2-2B",
         select_layer=1,
-        use_flash_attention=False,
+        use_flash_attention=True,
     )
 
+    assert loading_kwargs[-1]["attn_implementation"] == "flash_attention_2"
     assert len(backbone.language_model.layers) == 1
     output = backbone.forward(
         BatchFeature(
@@ -196,6 +201,14 @@ def test_n1_7_backbone_accepts_transformers_5_layout_and_forwards_mm_token_type_
     assert backbone.model.forward_kwargs["mm_token_type_ids"].tolist() == [[0, 1, 2, 0]]
     assert backbone.model.forward_kwargs["mm_token_type_ids"].dtype == torch.int32
     assert output["backbone_features"].shape == (1, 4, 4)
+
+    monkeypatch.setattr(groot_n1_7, "is_flash_attn_2_available", lambda: False)
+    groot_n1_7.Qwen3Backbone(
+        model_name="nvidia/Cosmos-Reason2-2B",
+        select_layer=1,
+        use_flash_attention=True,
+    )
+    assert loading_kwargs[-1]["attn_implementation"] == "sdpa"
 
 
 def test_n1_7_backbone_preserves_missing_qwen_optional_dependency_error(monkeypatch):

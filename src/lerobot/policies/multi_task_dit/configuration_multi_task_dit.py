@@ -43,9 +43,10 @@ class MultiTaskDiTConfig(PreTrainedConfig):
     beta_schedule: str = "squaredcos_cap_v2"  # Noise schedule type
     beta_start: float = 0.0001  # Starting noise level
     beta_end: float = 0.02  # Ending noise level
-    prediction_type: str = "epsilon"  # "epsilon" (predict noise) or "sample" (predict clean)
+    prediction_type: str = "epsilon"  # "epsilon", "sample", or "v_prediction"
     clip_sample: bool = True  # Clip samples during denoising
     clip_sample_range: float = 1.0  # Clipping range [-x, x]
+    inference_noise_scheduler_type: str | None = None  # Optional DDPM/DDIM inference-only override
     num_inference_steps: int | None = None  # Denoising steps at inference (defaults to num_train_timesteps)
 
     # --- Flow Matching-specific (used when objective="flow_matching") ---
@@ -162,8 +163,16 @@ class MultiTaskDiTConfig(PreTrainedConfig):
                 raise ValueError(
                     f"noise_scheduler_type must be 'DDPM' or 'DDIM', got {self.noise_scheduler_type}"
                 )
-            if self.prediction_type not in ["epsilon", "sample"]:
-                raise ValueError(f"prediction_type must be 'epsilon' or 'sample', got {self.prediction_type}")
+            if self.prediction_type not in ["epsilon", "sample", "v_prediction"]:
+                raise ValueError(
+                    "prediction_type must be 'epsilon', 'sample', or 'v_prediction', "
+                    f"got {self.prediction_type}"
+                )
+            if self.inference_noise_scheduler_type not in [None, "DDPM", "DDIM"]:
+                raise ValueError(
+                    "inference_noise_scheduler_type must be None, 'DDPM', or 'DDIM', "
+                    f"got {self.inference_noise_scheduler_type}"
+                )
             if self.num_train_timesteps <= 0:
                 raise ValueError(f"num_train_timesteps must be positive, got {self.num_train_timesteps}")
             if not (0.0 <= self.beta_start <= self.beta_end <= 1.0):

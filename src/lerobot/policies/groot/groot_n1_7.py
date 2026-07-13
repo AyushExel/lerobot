@@ -28,9 +28,10 @@ from huggingface_hub.errors import HFValidationError, RepositoryNotFoundError
 from torch import nn
 from torch.distributions import Beta
 
+from lerobot.policies.common.heads.cross_attention_dit import DiT
 from lerobot.utils.import_utils import _transformers_available, require_package
 
-from .action_head.cross_attention_dit import AlternateVLDiT, DiT, SelfAttentionTransformer
+from .action_head.cross_attention_dit import AlternateVLDiT, SelfAttentionTransformer
 from .configuration_groot import N1_7_DEFAULT_IMAGE_CROP_SIZE, N1_7_DEFAULT_IMAGE_TARGET_SIZE
 
 if TYPE_CHECKING or _transformers_available:
@@ -43,6 +44,7 @@ if TYPE_CHECKING or _transformers_available:
         Qwen3VLForConditionalGeneration,
     )
     from transformers.feature_extraction_utils import BatchFeature
+    from transformers.utils import is_flash_attn_2_available
 else:
     AutoConfig = None
     AutoModel = None
@@ -51,6 +53,7 @@ else:
     BatchFeature = None
     Qwen3VLConfig = None
     Qwen3VLForConditionalGeneration = None
+    is_flash_attn_2_available = None
 
 try:
     import tree
@@ -278,12 +281,12 @@ class Qwen3Backbone(nn.Module):
 
         extra_kwargs: dict[str, Any] = {}
         if use_flash_attention:
-            try:
-                import flash_attn  # noqa: F401
-
+            if is_flash_attn_2_available():
                 extra_kwargs["attn_implementation"] = "flash_attention_2"
-            except ImportError:
-                logger.warning("flash_attn is not installed. Falling back to SDPA attention.")
+            else:
+                logger.warning(
+                    "Flash Attention 2 is unavailable on this runtime. Falling back to SDPA attention."
+                )
                 extra_kwargs["attn_implementation"] = "sdpa"
         if load_bf16:
             extra_kwargs["torch_dtype"] = torch.bfloat16

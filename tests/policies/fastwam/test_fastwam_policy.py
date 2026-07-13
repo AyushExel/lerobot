@@ -26,7 +26,7 @@ pytest.importorskip("diffusers", reason="fastwam requires the `fastwam` extra (d
 
 from lerobot.configs import FeatureType, PolicyFeature, PreTrainedConfig
 from lerobot.policies import FastWAMConfig, get_policy_class, make_policy_config, make_pre_post_processors
-from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy
+from lerobot.policies.fastwam.modeling_fastwam import FastWAMPolicy, _batch_to_infer_kwargs
 from lerobot.policies.fastwam.processor_fastwam import FastWAMActionToggleProcessorStep
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -76,6 +76,10 @@ def test_config_validates_features_model_ids_and_saved_auto_route(tmp_path):
     assert FastWAMConfig(tokenizer_model_id="somebody/other-tokenizer").tokenizer_model_id == (
         "somebody/other-tokenizer"
     )
+    with pytest.raises(ValueError, match="does not support `tiled=True`"):
+        FastWAMConfig(tiled=True)
+    with pytest.raises(ValueError, match="does not support `tiled=True`"):
+        _batch_to_infer_kwargs({"tiled": True}, cfg)
 
 
 def test_preprocessor_passes_images_through_and_postprocessor_toggles_actions(tmp_path):

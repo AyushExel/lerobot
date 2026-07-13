@@ -16,11 +16,14 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from torch import nn
 
 import lerobot.policies.evo1.evo1_model as evo1_model
+import lerobot.policies.evo1.internvl3_embedder as internvl3_embedder
 import lerobot.policies.evo1.modeling_evo1 as modeling_evo1
 from lerobot.configs.types import FeatureType, PolicyFeature
 from lerobot.policies.evo1.configuration_evo1 import Evo1Config
@@ -332,6 +335,67 @@ def test_evo1_model_uses_image_resolution_and_trainable_checkpointing(monkeypatc
     stage2 = make_config(training_stage="stage2", image_resolution=(224, 224))
     evo1_model.Evo1Model(stage2)
     assert captured["enable_gradient_checkpointing"] is True
+
+
+@pytest.mark.parametrize(
+    ("flash_available", "expected_implementation"),
+    [(True, "flash_attention_2"), (False, "eager")],
+)
+def test_internvl3_uses_transformers_flash_attention_probe(
+    monkeypatch: pytest.MonkeyPatch,
+    flash_available: bool,
+    expected_implementation: str,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeTokenizer:
+        def convert_tokens_to_ids(self, token: str) -> int:
+            assert token == "<IMG_CONTEXT>"
+            return 7
+
+    class FakeLanguageModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Linear(1, 1), nn.Linear(1, 1)])
+
+    class FakeInternVLModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.language_model = FakeLanguageModel()
+            self.config = SimpleNamespace(
+                image_seq_length=4,
+                vision_config=SimpleNamespace(image_size=224),
+            )
+
+    class FakeAutoTokenizer:
+        @staticmethod
+        def from_pretrained(*args, **kwargs) -> FakeTokenizer:
+            return FakeTokenizer()
+
+    class FakeAutoModel:
+        @staticmethod
+        def from_pretrained(*args, **kwargs) -> FakeInternVLModel:
+            captured.update(kwargs)
+            return FakeInternVLModel()
+
+    monkeypatch.setattr(internvl3_embedder, "AutoTokenizer", FakeAutoTokenizer)
+    monkeypatch.setattr(internvl3_embedder, "AutoModel", FakeAutoModel)
+    monkeypatch.setattr(
+        internvl3_embedder,
+        "is_flash_attn_2_available",
+        lambda: flash_available,
+    )
+
+    internvl3_embedder.InternVL3Embedder(
+        model_name="local-test-model",
+        image_size=224,
+        device="cpu",
+        num_language_layers=1,
+        use_flash_attn=True,
+        enable_gradient_checkpointing=False,
+    )
+
+    assert captured["attn_implementation"] == expected_implementation
 
 
 class FakeInternVLModel(nn.Module):
