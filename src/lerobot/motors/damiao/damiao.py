@@ -20,7 +20,6 @@ import logging
 import time
 from contextlib import contextmanager
 from copy import deepcopy
-from functools import cached_property
 from typing import TYPE_CHECKING, Any, TypedDict
 
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
@@ -854,7 +853,11 @@ class DamiaoMotorsBus(MotorsBusBase):
         else:
             raise ValueError(f"Motor {motor_obj} doesn't have a valid recv_id (None).")
 
-    @cached_property
+    @property
     def is_calibrated(self) -> bool:
-        """Check if motors are calibrated."""
+        """Check if motors are calibrated.
+
+        Must NOT be cached: calibration status has to reflect the current
+        ``self.calibration`` (which changes after connect/calibrate/load).
+        """
         return bool(self.calibration)
