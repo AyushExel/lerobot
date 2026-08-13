@@ -268,22 +268,6 @@ def _connect(db_uri: str, storage_options: dict | None, revision: str | None = N
     return lancedb.connect(db_uri, **({"storage_options": options} if options else {}))
 
 
-def _stamp_storage_format(meta_dir: Path) -> None:
-    """Add ``"storage_format": "lance"`` to ``info.json`` when it is missing.
-
-    Meta written before the field existed (older converters, or caches
-    materialized by older versions of this module) would otherwise route
-    readers to the default parquet path.
-    """
-    info_path = meta_dir / "info.json"
-    if not info_path.exists():
-        return
-    info = json.loads(info_path.read_text())
-    if "storage_format" not in info:
-        info["storage_format"] = "lance"
-        info_path.write_text(json.dumps(info, indent=4))
-
-
 def _materialize_meta(db, local_root: Path) -> None:
     """Write ``meta/`` from the meta table to a local cache, once."""
     meta_dir = local_root / "meta"
@@ -308,7 +292,6 @@ def _materialize_meta(db, local_root: Path) -> None:
                     raise ValueError(f"meta table entry escapes the cache directory: {rel_path!r}")
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.write_bytes(batch.column("data")[i].as_py())
-        _stamp_storage_format(tmp_dir)
         try:
             tmp_dir.rename(meta_dir)
         except OSError:
@@ -346,10 +329,7 @@ def resolve_lance_root(
         # reuse (or overwrite) another revision's materialized meta.
         cache_key = f"{db_uri}@{revision}" if revision else db_uri
         local_root = HF_LEROBOT_HOME / "remote" / re.sub(r"[^A-Za-z0-9._-]+", "_", cache_key)
-        if (local_root / "meta").exists():
-            # A cache materialized by an older version may predate the field.
-            _stamp_storage_format(local_root / "meta")
-        else:
+        if not (local_root / "meta").exists():
             _materialize_meta(_connect(db_uri, storage_options, revision), local_root)
         return db_uri, local_root
     root_path = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
