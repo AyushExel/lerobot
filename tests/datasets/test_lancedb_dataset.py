@@ -13,12 +13,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Parity tests: LanceDBDataset must return the same items as LeRobotDataset."""
+"""The Lance storage backend behind the public LeRobotDataset facade.
+
+Parity tests construct BOTH sides through LeRobotDataset: the parquet fixture
+loads via the Parquet/MP4 reader, its converted copy via the Lance backend,
+and items must be bit-exact.
+"""
 
 import json
 import pickle
 from pathlib import Path
 
+import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
@@ -29,7 +35,6 @@ from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import lancedb_dataset as lancedb_module
 from lerobot.datasets.factory import make_dataset
 from lerobot.datasets.lancedb_dataset import (
-    LanceDBDataset,
     is_lance_dataset,
     lance_mp_context,
 )
@@ -42,6 +47,8 @@ from lerobot.datasets.language import (
     language_persistent_arrow_type,
 )
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.storage_backend import BackendDatasetReader
+from lerobot.datasets.utils import resolve_storage_format
 from lerobot.policies.factory import make_policy_config
 from tests.fixtures.constants import (
     DUMMY_CAMERA_FEATURES_WITH_DEPTH,
@@ -76,6 +83,14 @@ def dataset_roots(tmp_path, lerobot_dataset_factory) -> tuple[Path, Path]:
     return src_root, lance_root
 
 
+def open_lance(root, **kwargs) -> LeRobotDataset:
+    """Open a Lance root through the public facade and assert the backend was selected."""
+    ds = LeRobotDataset(DUMMY_REPO_ID, root=root, **kwargs)
+    assert type(ds) is LeRobotDataset
+    assert isinstance(ds.reader, BackendDatasetReader)
+    return ds
+
+
 def assert_items_equal(actual: dict, expected: dict) -> None:
     assert set(actual) == set(expected)
     for key, expected_val in expected.items():
@@ -90,7 +105,7 @@ def assert_items_equal(actual: dict, expected: dict) -> None:
 def test_tabular_parity(dataset_roots):
     src_root, lance_root = dataset_roots
     upstream = LeRobotDataset(DUMMY_REPO_ID, root=src_root)
-    lance_ds = LanceDBDataset(root=lance_root)
+    lance_ds = open_lance(lance_root)
     assert len(lance_ds) == len(upstream)
     for idx in [0, len(upstream) // 2, len(upstream) - 1]:
         assert_items_equal(lance_ds[idx], upstream[idx])
@@ -99,7 +114,7 @@ def test_tabular_parity(dataset_roots):
     fps = upstream.meta.fps
     delta_timestamps = {"state": [-2 / fps, -1 / fps, 0.0], "action": [0.0, 1 / fps, 2 / fps, 3 / fps]}
     upstream_d = LeRobotDataset(DUMMY_REPO_ID, root=src_root, delta_timestamps=delta_timestamps)
-    lance_d = LanceDBDataset(root=lance_root, delta_timestamps=delta_timestamps)
+    lance_d = open_lance(lance_root, delta_timestamps=delta_timestamps)
     ep_start = int(upstream_d.meta.episodes[1]["dataset_from_index"])
     ep_end = int(upstream_d.meta.episodes[1]["dataset_to_index"])
     for idx in [ep_start, ep_start + 5, ep_end - 1]:
@@ -115,9 +130,10 @@ def test_tabular_parity(dataset_roots):
 
     # episode subset: relative/absolute mapping mirrors upstream
     upstream_s = LeRobotDataset(DUMMY_REPO_ID, root=src_root, episodes=[1])
-    lance_s = LanceDBDataset(root=lance_root, episodes=[1])
+    lance_s = open_lance(lance_root, episodes=[1])
     assert len(lance_s) == len(upstream_s)
-    assert lance_s.absolute_to_relative_idx == upstream_s.reader._absolute_to_relative_idx
+    assert lance_s.absolute_to_relative_idx == upstream_s.absolute_to_relative_idx
+    assert lance_s.absolute_to_relative_idx is not None
     for idx in [0, len(upstream_s) - 1]:
         assert_items_equal(lance_s[idx], upstream_s[idx])
 
@@ -140,7 +156,7 @@ def video_dataset_roots(tmp_path, lerobot_dataset_factory) -> tuple[Path, Path]:
 def test_video_parity(video_dataset_roots):
     src_root, lance_root = video_dataset_roots
     upstream = LeRobotDataset(DUMMY_REPO_ID, root=src_root, video_backend="torchcodec")
-    lance_ds = LanceDBDataset(root=lance_root)
+    lance_ds = open_lance(lance_root)
     for idx in [0, len(upstream) // 2, len(upstream) - 1]:
         assert_items_equal(lance_ds[idx], upstream[idx])
 
@@ -159,7 +175,7 @@ def test_video_parity(video_dataset_roots):
     upstream_d = LeRobotDataset(
         DUMMY_REPO_ID, root=src_root, delta_timestamps=delta_timestamps, video_backend="torchcodec"
     )
-    lance_d = LanceDBDataset(root=lance_root, delta_timestamps=delta_timestamps)
+    lance_d = open_lance(lance_root, delta_timestamps=delta_timestamps)
     ep_start = int(upstream_d.meta.episodes[1]["dataset_from_index"])
     for idx in [0, ep_start - 1, ep_start]:
         expected = upstream_d[idx]
@@ -172,17 +188,19 @@ def test_video_parity(video_dataset_roots):
     upstream_1 = LeRobotDataset(
         DUMMY_REPO_ID, root=src_root, delta_timestamps=single, video_backend="torchcodec"
     )
-    lance_1 = LanceDBDataset(root=lance_root, delta_timestamps=single)
+    lance_1 = open_lance(lance_root, delta_timestamps=single)
     for idx in [0, len(upstream_1) - 1]:
         assert_items_equal(lance_1[idx], upstream_1[idx])
 
     # return_uint8: raw frames, no normalization
-    lance_u8 = LanceDBDataset(root=lance_root, return_uint8=True)
+    lance_u8 = open_lance(lance_root, return_uint8=True)
     item = lance_u8[0]
     assert item[video_key].dtype == torch.uint8
 
 
-def test_factory_autodetects_lance(video_dataset_roots):
+def test_factory_returns_single_public_class(video_dataset_roots):
+    """The factory is format-agnostic: always LeRobotDataset; the storage
+    backend is selected from metadata underneath."""
     src_root, lance_root = video_dataset_roots
     assert is_lance_dataset(root=lance_root)
     assert not is_lance_dataset(root=src_root)
@@ -194,15 +212,19 @@ def test_factory_autodetects_lance(video_dataset_roots):
         )
         return make_dataset(cfg)
 
-    assert isinstance(make(lance_root), LanceDBDataset)
-    assert isinstance(make(src_root), LeRobotDataset)
+    lance_ds = make(lance_root)
+    assert type(lance_ds) is LeRobotDataset
+    assert isinstance(lance_ds.reader, BackendDatasetReader)
+    parquet_ds = make(src_root)
+    assert type(parquet_ds) is LeRobotDataset
+    assert not isinstance(parquet_ds.reader, BackendDatasetReader)
     # A file:// URI root must route to the same local lance dataset
-    assert isinstance(make(f"file://{lance_root}"), LanceDBDataset)
+    assert isinstance(make(f"file://{lance_root}").reader, BackendDatasetReader)
 
 
 def test_pickle_and_dataloader(dataset_roots):
     _, lance_root = dataset_roots
-    lance_ds = LanceDBDataset(root=lance_root)
+    lance_ds = open_lance(lance_root)
     restored = pickle.loads(pickle.dumps(lance_ds))
     assert_items_equal(restored[7], lance_ds[7])
 
@@ -266,7 +288,7 @@ def test_language_columns_parity(tmp_path, lerobot_dataset_factory):
     convert(lance_root, root=src_root)
 
     upstream = LeRobotDataset(DUMMY_REPO_ID, root=src_root)
-    lance_ds = LanceDBDataset(root=lance_root)
+    lance_ds = open_lance(lance_root)
     assert lance_ds.meta.has_language_columns
 
     # indices hit every shape: both populated (0,12), persistent-only (33),
@@ -324,3 +346,76 @@ def test_storage_format_field_drives_selection(tmp_path):
     (parquet / "data").mkdir()
     (parquet / "meta" / "info.json").write_text(json.dumps({"codebase_version": "v3.0"}))
     assert is_lance_dataset(root=str(parquet)) is False
+
+    # A declared-but-unsupported format must fail loudly, not fall back to parquet.
+    unsupported = tmp_path / "unsupported"
+    (unsupported / "meta").mkdir(parents=True)
+    (unsupported / "meta" / "info.json").write_text(json.dumps({"storage_format": "webdataset"}))
+    with pytest.raises(ValueError, match="Unsupported storage_format"):
+        is_lance_dataset(root=str(unsupported))
+
+
+def test_dataloader_batch_is_one_backend_call(dataset_roots):
+    """DataLoader -> __getitems__ -> reader.get_items -> backend.get_items: one call per batch."""
+    _, lance_root = dataset_roots
+    ds = open_lance(lance_root)
+    backend = ds.reader._backend
+    calls: list[list[int]] = []
+    original = backend.get_items
+    backend.get_items = lambda indices: (calls.append(list(indices)) or original(indices))
+
+    loader = torch.utils.data.DataLoader(ds, batch_size=8, num_workers=0, shuffle=True, drop_last=True)
+    n_batches = sum(1 for _ in loader)
+
+    assert n_batches == len(ds) // 8
+    assert len(calls) == n_batches, "expected exactly one batched backend read per DataLoader batch"
+    assert all(len(indices) == 8 for indices in calls)
+
+
+def test_facade_methods(dataset_roots):
+    """The public LeRobotDataset surface works (or fails loudly) on the Lance backend."""
+    src_root, lance_root = dataset_roots
+    upstream = LeRobotDataset(DUMMY_REPO_ID, root=src_root)
+    lance_ds = open_lance(lance_root)
+
+    # hf_dataset is inherently parquet-specific: AttributeError (so hasattr probes work)
+    assert hasattr(upstream, "hf_dataset")
+    assert not hasattr(lance_ds, "hf_dataset")
+    with pytest.raises(AttributeError, match="storage backend"):
+        _ = lance_ds.hf_dataset
+
+    columns_lance = lance_ds.select_columns("state")
+    columns_parquet = upstream.select_columns("state")
+    assert len(columns_lance) == len(columns_parquet)
+    for idx in [0, len(upstream) // 2, len(upstream) - 1]:
+        torch.testing.assert_close(
+            torch.as_tensor(columns_lance[idx]["state"]),
+            torch.as_tensor(columns_parquet[idx]["state"]),
+            rtol=0,
+            atol=0,
+        )
+
+    assert np.array_equal(
+        np.asarray(lance_ds.get_column("task_index")), np.asarray(upstream.get_column("task_index"))
+    )
+    assert np.array_equal(
+        np.asarray(open_lance(lance_root, episodes=[1]).get_column("index")),
+        np.asarray(LeRobotDataset(DUMMY_REPO_ID, root=src_root, episodes=[1]).get_column("index")),
+    )
+
+    assert_items_equal(lance_ds.get_raw_item(33), upstream.get_raw_item(33))
+
+
+def test_storage_format_stamped_by_converter(dataset_roots, caplog):
+    """The converter declares storage_format; selection and metadata honor it end to end."""
+    import logging
+
+    _, lance_root = dataset_roots
+    info = json.loads((lance_root / "meta" / "info.json").read_text())
+    assert info.get("storage_format") == "lance", "converter must stamp storage_format"
+    assert resolve_storage_format(root=str(lance_root)) == "lance"
+
+    with caplog.at_level(logging.WARNING):
+        ds = open_lance(lance_root)
+    assert "Unknown fields" not in caplog.text, "storage_format must be a declared DatasetInfo field"
+    assert ds.meta.info.get("storage_format") == "lance"

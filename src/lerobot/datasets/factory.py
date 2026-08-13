@@ -26,11 +26,10 @@ from lerobot.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
 
 from .dataset_metadata import LeRobotDatasetMetadata
-from .lancedb_dataset import LanceDBDataset, is_lance_dataset, lance_metadata
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .streaming_dataset import StreamingLeRobotDataset
-from .utils import resolve_episode_indices
+from .utils import resolve_episode_indices, resolve_storage_format
 
 
 def resolve_delta_timestamps(
@@ -74,26 +73,13 @@ def _make_map_dataset(
     delta_timestamps: dict[str, list] | None,
     image_transforms,
     depth_output_unit: str | None = None,
-) -> LeRobotDataset | LanceDBDataset:
-    """Instantiate a map-style dataset, auto-detecting the on-disk/Hub format.
+) -> LeRobotDataset:
+    """Instantiate a map-style dataset.
 
-    Datasets stored in the Lance layout (a ``frames.lance`` table next to the
-    standard ``meta/`` directory) load through :class:`LanceDBDataset`;
-    everything else through :class:`LeRobotDataset`.
+    ``LeRobotDataset`` selects the storage backend (Parquet/MP4, Lance, ...)
+    from the dataset's metadata, so the factory is format-agnostic.
     """
     kwargs = {"depth_output_unit": depth_output_unit} if depth_output_unit is not None else {}
-    if is_lance_dataset(cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision):
-        return LanceDBDataset(
-            cfg.dataset.repo_id,
-            root=cfg.dataset.root,
-            episodes=episodes,
-            delta_timestamps=delta_timestamps,
-            image_transforms=image_transforms,
-            revision=cfg.dataset.revision,
-            return_uint8=True,
-            tolerance_s=cfg.tolerance_s,
-            **kwargs,
-        )
     if cfg.dataset.repo_type == "bucket":
         raise ValueError(
             "repo_type='bucket' is streaming-only: set dataset.streaming=true to train from an HF Storage Bucket."
@@ -112,7 +98,26 @@ def _make_map_dataset(
     )
 
 
-def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | LanceDBDataset | MultiLeRobotDataset:
+def _make_dataset_metadata(
+    storage_format: str,
+    repo_id: str,
+    root,
+    revision: str | None,
+    repo_type: str,
+) -> LeRobotDatasetMetadata:
+    """Build metadata for a dataset, dispatching on its storage format.
+
+    Non-default backends transport the standard ``meta/`` tree themselves (e.g.
+    from an object-store URI ``LeRobotDatasetMetadata(root=...)`` cannot reach).
+    """
+    if storage_format == "lance":
+        from .lancedb_dataset import lance_metadata  # noqa: PLC0415 - optional lancedb extra
+
+        return lance_metadata(repo_id, root, revision)
+    return LeRobotDatasetMetadata(repo_id, root=root, revision=revision, repo_type=repo_type)
+
+
+def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDataset:
     """Handles the logic of setting up delta timestamps and image transforms before creating a dataset.
 
     Args:
@@ -129,24 +134,18 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | LanceDBDataset | 
     )
 
     if isinstance(cfg.dataset.repo_id, str):
-        # Detect Lance BEFORE building metadata: a Lance dataset can live at an
-        # object-store URI (s3://, gs://, hf://), and LeRobotDatasetMetadata(root=...)
-        # would collapse the URI via Path() and silently fall back to a Hub download.
-        lance = is_lance_dataset(cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision)
-        if lance and cfg.dataset.streaming:
+        storage_format = resolve_storage_format(cfg.dataset.repo_id, cfg.dataset.root, cfg.dataset.revision)
+        if storage_format != "parquet" and cfg.dataset.streaming:
             raise ValueError(
-                "dataset.streaming=True is not supported for Lance datasets: LanceDBDataset "
-                "already reads directly from the Hub without downloading data files."
+                f"dataset.streaming=True is not supported for storage_format={storage_format!r} "
+                "datasets: their backend already reads remotely without downloading data files."
             )
-        ds_meta = (
-            lance_metadata(cfg.dataset.repo_id, cfg.dataset.root, cfg.dataset.revision)
-            if lance
-            else LeRobotDatasetMetadata(
-                cfg.dataset.repo_id,
-                root=cfg.dataset.root,
-                revision=cfg.dataset.revision,
-                repo_type=cfg.dataset.repo_type,
-            )
+        ds_meta = _make_dataset_metadata(
+            storage_format,
+            cfg.dataset.repo_id,
+            cfg.dataset.root,
+            cfg.dataset.revision,
+            cfg.dataset.repo_type,
         )
         delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta)
         episodes = resolve_episode_indices(
@@ -199,7 +198,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | LanceDBDataset | 
 
 def make_train_eval_datasets(
     cfg: TrainPipelineConfig,
-) -> tuple[LeRobotDataset | LanceDBDataset | MultiLeRobotDataset, LeRobotDataset | LanceDBDataset | None]:
+) -> tuple[LeRobotDataset | MultiLeRobotDataset, LeRobotDataset | None]:
     """Create train and optional eval datasets by splitting episodes based on eval_split.
 
     The last ceil(n_episodes * eval_split) episodes per task are held out for evaluation.

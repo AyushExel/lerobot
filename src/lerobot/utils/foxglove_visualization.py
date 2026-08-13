@@ -446,7 +446,7 @@ def serve_foxglove_dataset_playback(
     )
 
     # Per-frame timestamps in nanoseconds (read straight from the table, no video decode).
-    times_ns = [int(round(float(t) * 1e9)) for t in dataset.hf_dataset["timestamp"]]
+    times_ns = [int(round(float(t) * 1e9)) for t in dataset.get_column("timestamp")]
     n_frames = len(times_ns)
     if n_frames == 0:
         raise ValueError("Cannot visualize an empty episode.")

@@ -27,17 +27,17 @@ import shutil
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import av
+import datasets
 import huggingface_hub
 import numpy as np
 import torch
 
 from lerobot.configs.video import DEFAULT_DEPTH_UNIT, DepthEncoderConfig
-from lerobot.utils.constants import HF_LEROBOT_HOME, HF_LEROBOT_HUB_CACHE
+from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.import_utils import _lancedb_available, require_package
 
 if TYPE_CHECKING or _lancedb_available:
@@ -47,6 +47,8 @@ if TYPE_CHECKING or _lancedb_available:
 from .dataset_metadata import LeRobotDatasetMetadata
 from .depth_utils import dequantize_depth
 from .feature_utils import check_delta_timestamps, get_delta_indices
+from .io_utils import hf_transform_to_torch
+from .utils import resolve_storage_format
 from .video_utils import FrameTimestampError, decode_video_frames_pyav
 
 FRAMES_TABLE = "frames"
@@ -300,56 +302,11 @@ def lance_mp_context() -> str:
     return "forkserver" if "forkserver" in multiprocessing.get_all_start_methods() else "spawn"
 
 
-def _storage_format_from_info(info_file: Path) -> str | None:
-    """``storage_format`` declared in a ``meta/info.json``, or None (absent/unreadable)."""
-    try:
-        return json.loads(info_file.read_text()).get("storage_format")
-    except (OSError, ValueError):
-        return None
-
-
-@lru_cache(maxsize=32)
 def is_lance_dataset(
     repo_id: str | None = None, root: str | Path | None = None, revision: str | None = None
 ) -> bool:
-    """True if the dataset's storage format is Lance: metadata's ``storage_format``
-    field decides when present; layout detection is only a legacy fallback."""
-    if root is None and repo_id is None:
-        return False
-    if root is not None and _is_remote_uri(root):
-        return True  # object-store URIs are only served by the Lance backend
-    local_root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
-    fmt = _storage_format_from_info(local_root / "meta" / "info.json")
-    if fmt is not None:
-        return fmt == "lance"
-    if (local_root / f"{FRAMES_TABLE}.lance").exists():
-        return True
-    if (local_root / "meta" / "info.json").exists() and (local_root / "data").exists():
-        return False  # complete local parquet/MP4 layout, skip the Hub lookups
-    if repo_id is None:
-        return False
-    # Hub info.json lands in the cache the metadata loader also uses, so the
-    # parquet path pays no extra request.
-    try:
-        info_file = huggingface_hub.hf_hub_download(
-            repo_id,
-            "meta/info.json",
-            repo_type="dataset",
-            revision=revision,
-            cache_dir=HF_LEROBOT_HUB_CACHE,
-        )
-        fmt = _storage_format_from_info(Path(info_file))
-    except Exception:
-        fmt = None
-    if fmt is not None:
-        return fmt == "lance"
-    try:  # legacy Lance datasets (converted before `storage_format`): layout probe
-        paths = huggingface_hub.HfApi().get_paths_info(
-            repo_id, [f"{FRAMES_TABLE}.lance"], repo_type="dataset", revision=revision
-        )
-    except Exception:  # fall back to the parquet loader
-        return False
-    return len(paths) > 0
+    """True if the dataset's storage format resolves to Lance."""
+    return resolve_storage_format(repo_id, root, revision) == "lance"
 
 
 def resolve_lance_root(
@@ -357,6 +314,7 @@ def resolve_lance_root(
     root: str | Path | None,
     storage_options: dict | None = None,
     revision: str | None = None,
+    force_refresh: bool = False,
 ) -> tuple[str, Path]:
     """Resolve a Lance dataset to its connect URI and the local root holding ``meta/``"""
     if root is not None and _is_remote_uri(root):
@@ -365,6 +323,8 @@ def resolve_lance_root(
         # reuse (or overwrite) another revision's materialized meta.
         cache_key = f"{db_uri}@{revision}" if revision else db_uri
         local_root = HF_LEROBOT_HOME / "remote" / re.sub(r"[^A-Za-z0-9._-]+", "_", cache_key)
+        if force_refresh and (local_root / "meta").exists():
+            shutil.rmtree(local_root / "meta")
         if not (local_root / "meta").exists():
             _materialize_meta(_connect(db_uri, storage_options, revision), local_root)
         return db_uri, local_root
@@ -409,6 +369,9 @@ class LanceDBDataset(torch.utils.data.Dataset):
         revision: Hub revision for the ``meta/`` download.
         return_uint8: Return RGB frames as raw uint8 instead of normalized float32.
         storage_options: Extra options forwarded to ``lancedb.connect``.
+        token: Hub authentication token, as in :class:`LeRobotDataset`. A string
+            token is also forwarded to the object store for ``hf://`` roots.
+        force_cache_sync: Re-download / re-materialize the cached ``meta/`` tree.
         video_decoder_cache_size: Max decoders per worker (default 16, also
             bounded by a 2 GiB per-worker byte budget).
         depth_output_unit: Unit depth features dequantize to (``'mm'`` or ``'m'``).
@@ -429,6 +392,8 @@ class LanceDBDataset(torch.utils.data.Dataset):
         storage_options: dict | None = None,
         video_decoder_cache_size: int | None = None,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
+        token: str | bool | None = None,
+        force_cache_sync: bool = False,
     ):
         super().__init__()
         require_package("lancedb", extra="lancedb")
@@ -437,12 +402,21 @@ class LanceDBDataset(torch.utils.data.Dataset):
 
         self.repo_id = repo_id
         self.tolerance_s = tolerance_s
+        if isinstance(token, str):
+            storage_options = {**(storage_options or {})}
+            storage_options.setdefault("token", token)
         self._storage_options = storage_options
 
-        self._db_uri, self.root = resolve_lance_root(repo_id, root, self._storage_options, revision)
+        self._db_uri, self.root = resolve_lance_root(
+            repo_id, root, self._storage_options, revision, force_refresh=force_cache_sync
+        )
 
         self.meta = LeRobotDatasetMetadata(
-            repo_id if repo_id is not None else str(self.root), root=self.root, revision=revision
+            repo_id if repo_id is not None else str(self.root),
+            root=self.root,
+            revision=revision,
+            force_cache_sync=force_cache_sync,
+            token=token,
         )
         self._hub_revision = self.meta.revision if self._db_uri == f"hf://datasets/{repo_id}" else None
 
@@ -533,6 +507,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
             for key in self.meta.video_keys
         }
 
+        self._frames_table = None
         self._frames_perm = None
         self._videos_table = None
         self._video_row_ids: dict[tuple, int] | None = None
@@ -562,6 +537,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
                 f"frames table has {n_rows} rows but meta declares "
                 f"{self.meta.total_frames} frames; the dataset is truncated or corrupt."
             )
+        self._frames_table = table
         self._frames_perm = (
             Permutation.identity(table).select_columns(self._fetch_columns).with_format("arrow")
         )
@@ -593,6 +569,7 @@ class LanceDBDataset(torch.utils.data.Dataset):
 
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
+        state["_frames_table"] = None
         state["_frames_perm"] = None
         state["_videos_table"] = None
         state["_video_row_ids"] = None
@@ -635,6 +612,78 @@ class LanceDBDataset(torch.utils.data.Dataset):
 
     def get_item(self, idx: int) -> dict:
         return self.get_items([idx])[0]
+
+    def _abs_rows(self, indices: list[int] | None = None) -> list[int]:
+        """Absolute frames-table rows for relative indices (all rows when None)."""
+        if self.episodes is not None:
+            rows = self._rel_to_abs if indices is None else self._rel_to_abs[indices]
+            return [int(row) for row in rows]
+        if indices is None:
+            return list(range(self.meta.total_frames))
+        return [int(idx) for idx in indices]
+
+    def select_columns(self, column_names: str | list[str]) -> datasets.Dataset:
+        """Tabular column(s) as a ``datasets.Dataset``, as LeRobotDataset.select_columns."""
+        names = [column_names] if isinstance(column_names, str) else list(column_names)
+        unknown = [name for name in names if name not in self._tabular_keys]
+        if unknown:
+            raise ValueError(
+                f"Column(s) {unknown} are not tabular features of this dataset. "
+                f"The Lance backend serves tabular columns only; available: {self._tabular_keys}."
+            )
+        self._ensure_open()
+        columns = self._fetch_rows(self._abs_rows())
+        out = {}
+        for name in names:
+            data = columns[name]
+            shape = self._feature_shapes[name]
+            if isinstance(data, np.ndarray) and len(shape) > 1:
+                data = data.reshape(len(data), *shape)
+            out[name] = data.tolist() if isinstance(data, np.ndarray) else data
+        table = datasets.Dataset.from_dict(out)
+        table.set_transform(hf_transform_to_torch)
+        return table
+
+    def get_column(self, name: str) -> np.ndarray | list:
+        """One tabular column over the selected episodes (lists for string/language)."""
+        if name not in self._tabular_keys:
+            raise ValueError(
+                f"'{name}' is not a tabular feature of this dataset; available: {self._tabular_keys}."
+            )
+        self._ensure_open()
+        lance_name = self._fetch_columns[self._tabular_keys.index(name)]
+        perm = Permutation.identity(self._frames_table).select_columns([lance_name]).with_format("arrow")
+        array = perm.__getitems__(self._abs_rows()).column(lance_name)
+        if hasattr(array, "combine_chunks"):
+            array = array.combine_chunks()
+        if name in self._language_keys or name in self._string_keys:
+            return array.to_pylist()
+        if hasattr(array, "flatten") and hasattr(array.type, "value_type"):
+            values = array.flatten().to_numpy(zero_copy_only=False)
+            return values.reshape(len(array), -1)
+        return array.to_numpy(zero_copy_only=False)
+
+    def get_raw_item(self, idx: int) -> dict:
+        """Raw tabular row: no delta windows, video decoding, or image transforms."""
+        self._ensure_open()
+        columns = self._fetch_rows(self._abs_rows([idx]))
+        item = {}
+        for key in self._tabular_keys:
+            data = columns[key]
+            shape = self._feature_shapes[key]
+            if key in self._language_keys:
+                item[key] = data[0]
+            elif key in self._string_keys:
+                value = data[0]
+                item[key] = value if isinstance(value, str) or value is None else str(value)
+            elif getattr(data, "ndim", 1) > 1:
+                value = data[0]
+                if len(shape) > 1:
+                    value = value.reshape(shape)
+                item[key] = torch.from_numpy(value.copy())
+            else:
+                item[key] = torch.tensor(data[0])
+        return item
 
     def get_items(self, indices: list[int]) -> list[dict]:
         """Batched fetch: one deduplicated frames-table read and one blob fetch per batch."""

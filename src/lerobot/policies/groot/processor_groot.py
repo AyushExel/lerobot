@@ -738,10 +738,12 @@ def _compute_horizon_relative_action_stats(
 
 def _iter_action_state_training_samples(dataset: Any):
     ensure_reader = getattr(dataset, "_ensure_reader", None)
-    if callable(ensure_reader):
-        reader = ensure_reader()
-        if reader.hf_dataset is None:
-            reader.load_and_activate()
+    reader = ensure_reader() if callable(ensure_reader) else None
+    if reader is not None and reader.hf_dataset is None:
+        reader.load_and_activate()
+    # Storage-backend readers have no hf_dataset; those datasets take the
+    # generic item path below.
+    if reader is not None and reader.hf_dataset is not None:
         delta_indices = getattr(reader, "delta_indices", None)
         for idx in range(len(dataset)):
             item = reader.hf_dataset[idx]

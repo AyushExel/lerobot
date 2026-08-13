@@ -20,13 +20,14 @@ import json
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 import datasets
 import numpy as np
 import packaging.version
 import torch
-from huggingface_hub import DatasetCard, DatasetCardData, HfApi
+from huggingface_hub import DatasetCard, DatasetCardData, HfApi, hf_hub_download
 
 from lerobot.utils.utils import flatten_dict, unflatten_dict
 
@@ -545,3 +546,68 @@ def safe_shard(dataset: datasets.IterableDataset, index: int, num_shards: int) -
     shard_idx = min(dataset.num_shards, index + 1) - 1
 
     return dataset.shard(num_shards, index=shard_idx)
+
+
+# ── Storage-format resolution ───────────────────────────────────────────────
+
+KNOWN_STORAGE_FORMATS = ("parquet", "lance")
+
+
+def _declared_storage_format(info_file: Path) -> str | None:
+    """``storage_format`` declared in a ``meta/info.json``, or None (absent/unreadable)."""
+    try:
+        fmt = json.loads(info_file.read_text()).get("storage_format")
+    except (OSError, ValueError):
+        return None
+    if fmt is not None and fmt not in KNOWN_STORAGE_FORMATS:
+        raise ValueError(
+            f"Unsupported storage_format {fmt!r} declared in {info_file}; "
+            f"this lerobot version supports {sorted(KNOWN_STORAGE_FORMATS)}."
+        )
+    return fmt
+
+
+@lru_cache(maxsize=32)
+def resolve_storage_format(
+    repo_id: str | None = None, root: str | Path | None = None, revision: str | None = None
+) -> str:
+    """Storage format of a dataset: metadata's ``storage_format`` field decides when
+    present; layout detection is only a fallback for datasets converted before the
+    field existed. Defaults to "parquet"."""
+    from lerobot.utils.constants import HF_LEROBOT_HOME, HF_LEROBOT_HUB_CACHE  # noqa: PLC0415
+
+    if root is None and repo_id is None:
+        return "parquet"
+    if root is not None and "://" in str(root):
+        return "lance"  # object-store URIs are only served by the Lance backend
+    local_root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
+    fmt = _declared_storage_format(local_root / "meta" / "info.json")
+    if fmt is not None:
+        return fmt
+    if (local_root / "frames.lance").exists():
+        return "lance"
+    if (local_root / "meta" / "info.json").exists() and (local_root / "data").exists():
+        return "parquet"  # complete local parquet/MP4 layout, skip the Hub lookups
+    if repo_id is None:
+        return "parquet"
+    # Hub info.json lands in the cache the metadata loader also uses, so the
+    # parquet path pays no extra request.
+    try:
+        info_file = hf_hub_download(
+            repo_id,
+            "meta/info.json",
+            repo_type="dataset",
+            revision=revision,
+            cache_dir=HF_LEROBOT_HUB_CACHE,
+        )
+    except Exception:
+        info_file = None
+    if info_file is not None:
+        fmt = _declared_storage_format(Path(info_file))  # raises on unsupported values
+        if fmt is not None:
+            return fmt
+    try:  # legacy Lance datasets (converted before `storage_format`): layout probe
+        paths = HfApi().get_paths_info(repo_id, ["frames.lance"], repo_type="dataset", revision=revision)
+    except Exception:
+        return "parquet"
+    return "lance" if paths else "parquet"

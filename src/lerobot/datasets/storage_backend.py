@@ -54,6 +54,12 @@ class StorageBackend(Protocol):
         """Batched read — the perf-critical path: one fetch per call, not per item."""
         ...
 
+    def select_columns(self, column_names): ...
+
+    def get_column(self, name: str): ...
+
+    def get_raw_item(self, idx: int) -> dict: ...
+
 
 class BackendDatasetReader(DatasetReader):
     """DatasetReader whose retrieval is served by a StorageBackend.
@@ -96,6 +102,15 @@ class BackendDatasetReader(DatasetReader):
 
     def get_items(self, indices: list[int]) -> list[dict]:
         return self._backend.get_items(indices)
+
+    def select_columns(self, column_names):
+        return self._backend.select_columns(column_names)
+
+    def get_column(self, name: str):
+        return self._backend.get_column(name)
+
+    def get_raw_item(self, idx) -> dict:
+        return self._backend.get_raw_item(idx)
 
 
 try:

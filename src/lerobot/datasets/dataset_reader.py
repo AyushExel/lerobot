@@ -344,6 +344,27 @@ class DatasetReader:
         batched primitive override this; the Parquet/MP4 path reads per item."""
         return [self.get_item(idx) for idx in indices]
 
+    def select_columns(self, column_names: str | list[str]) -> datasets.Dataset:
+        """Tabular column(s) as a ``datasets.Dataset``, without decoding videos."""
+        return self.hf_dataset.select_columns(column_names)
+
+    def get_column(self, name: str):
+        """One tabular column's values, without decoding videos."""
+        column = self.hf_dataset.data.column(name)
+        if hasattr(column, "combine_chunks"):
+            column = column.combine_chunks()
+        if hasattr(column, "flatten") and hasattr(column.type, "value_type"):
+            values = column.flatten().to_numpy(zero_copy_only=False)
+            return values.reshape(len(column), -1)
+        try:
+            return column.to_numpy(zero_copy_only=False)
+        except Exception:
+            return column.to_pylist()
+
+    def get_raw_item(self, idx) -> dict:
+        """Raw tabular row: no delta windows, video decoding, or image transforms."""
+        return self.hf_dataset[idx]
+
     def get_item(self, idx) -> dict:
         """Core __getitem__ logic. Assumes hf_dataset is loaded.
 
