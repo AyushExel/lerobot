@@ -162,7 +162,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 into. If set, all dataset files are materialized directly under this path. If not set,
                 existing local datasets are still looked up under ``$HF_LEROBOT_HOME/{repo_id}``, but Hub
                 downloads use a revision-safe snapshot cache under
-                ``$HF_LEROBOT_HOME/hub``. May also be an object-store URI (e.g. ``s3://bucket/dataset``)
+                ``$HF_LEROBOT_HOME/hub``. May also be an object-store URI (e.g. ``hf://datasets/{repo_id}``)
                 for storage formats that read data in place; only ``meta/`` is then materialized locally.
             episodes (list[int] | None, optional): If specified, this will only load episodes specified by
                 their episode_index in this list. Defaults to None.
@@ -221,7 +221,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         super().__init__()
         self.repo_id = repo_id
         self._storage_backend: StorageBackend | None = None
-        # Datasets can live at an object-store root (e.g. ``s3://bucket/ds``): a
+        # Datasets can live at an object-store root (e.g. ``hf://datasets/...``): a
         # storage backend reads the data in place and only ``meta/`` is localized.
         self._storage_root = root if root is not None and is_remote_uri(root) else None
         if self._storage_root is not None:
@@ -269,8 +269,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         self.episodes = episodes
 
         if self.meta.storage_format != DEFAULT_STORAGE_FORMAT:
-            # Non-default formats read through a storage backend: there is
-            # nothing to download and no local parquet/video files to decode.
+            # Non-default formats delegate all data access to their storage
+            # backend; the parquet/mp4 reader below does not apply to them.
             self._storage_backend = make_storage_backend(
                 self.meta.storage_format,
                 meta=self.meta,

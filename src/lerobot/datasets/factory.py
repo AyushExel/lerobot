@@ -120,7 +120,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
 
     if isinstance(cfg.dataset.repo_id, str):
         # Storage-aware loader: same as LeRobotDatasetMetadata(...), plus support
-        # for datasets whose root is an object-store URI (e.g. ``s3://``).
+        # for datasets whose root is an object-store URI (e.g. ``hf://``).
         ds_meta = load_dataset_metadata(
             cfg.dataset.repo_id,
             root=cfg.dataset.root,
@@ -134,8 +134,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         if cfg.dataset.streaming and ds_meta.storage_format != DEFAULT_STORAGE_FORMAT:
             raise ValueError(
                 f"dataset.streaming=True is not supported for storage_format="
-                f"{ds_meta.storage_format!r}: its backend already reads directly from "
-                "remote storage without downloading data files."
+                f"{ds_meta.storage_format!r}: StreamingLeRobotDataset only reads the default "
+                f"{DEFAULT_STORAGE_FORMAT!r} layout. Note that some formats (e.g. 'lance') "
+                "support remote map-style access without streaming mode."
             )
         if not cfg.dataset.streaming:
             if cfg.dataset.repo_type == "bucket":

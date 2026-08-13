@@ -19,7 +19,7 @@
 Serves datasets whose ``meta/info.json`` declares ``"storage_format": "lance"``:
 tabular features live in a ``frames.lance`` table and mp4 files in a blob-encoded
 ``videos.lance`` table, next to the standard ``meta/`` directory. Tables are read
-in place — locally, from the Hub (``hf://``), or from an object store (``s3://``).
+in place — locally, from the Hub (``hf://``), or from any object store.
 
 Everything here is an implementation detail of the ``"lance"`` storage format;
 the public entry point is ``LeRobotDataset`` (see :mod:`lerobot.datasets.storage`).
@@ -359,8 +359,8 @@ class LanceBackend:
     Args:
         meta: Already-loaded dataset metadata (never rebuilt or mutated here).
         root: Local dir with ``meta/`` and ``.lance`` tables, or an object-store
-            URI (``s3://...``) with the same layout. ``None`` streams the tables
-            from the Hub repo ``meta.repo_id`` over ``hf://``.
+            URI with the same layout. ``None`` streams the tables from the Hub
+            repo ``meta.repo_id`` over ``hf://``.
         episodes: Episode indices to select. ``None`` means all.
         image_transforms: Optional torchvision v2 transform for camera frames.
         delta_timestamps: Feature key -> relative timestamp offsets (seconds), as

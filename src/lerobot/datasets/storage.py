@@ -39,7 +39,7 @@ DEFAULT_STORAGE_FORMAT = "parquet"
 # stay optional. Importing the module runs its ``@register_storage_backend``.
 _STORAGE_BACKEND_MODULES = {"lance": "lerobot.datasets.lance_backend"}
 
-# An object-store root (e.g. ``s3://bucket/dataset``) carries no local ``meta/``
+# An object-store root (e.g. ``hf://datasets/{repo_id}``) carries no local ``meta/``
 # to read the format from before a backend localizes it. Lance is currently the
 # only URI-addressable format; revisit if another one appears.
 _REMOTE_ROOT_FORMAT = "lance"
@@ -73,7 +73,7 @@ class StorageBackend(Protocol):
 
 
 def is_remote_uri(root: str | Path) -> bool:
-    """True for object-store style roots (``s3://…``, ``hf://…``, ``file://…``)."""
+    """True for object-store style roots (``hf://…``, ``file://…``, …)."""
     return "://" in str(root)
 
 
