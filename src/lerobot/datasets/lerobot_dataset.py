@@ -212,8 +212,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         """
         super().__init__()
         self.repo_id = repo_id
-        # An object-store URI (s3://, gs://, hf://) can only be served by a
-        # remote-capable storage backend; never treat it as a local path.
+        # Object-store URIs (s3://, gs://, hf://) are served by a storage backend, not a local path.
         remote_root = root is not None and "://" in str(root)
         self._requested_root = None if remote_root else (Path(root) if root else None)
         self.delta_timestamps = delta_timestamps
@@ -228,14 +227,12 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if self._requested_root is not None:
             self._requested_root.mkdir(exist_ok=True, parents=True)
 
-        # Storage-backend selection: a Lance-formatted dataset plugs in as a
-        # StorageBackend behind DatasetReader, so LeRobotDataset stays the single
-        # public class. Selected by metadata's `storage_format` field, with layout
-        # detection as fallback for datasets converted before the field existed.
+        # Storage-backend selection: metadata's `storage_format` field decides,
+        # with layout detection as fallback for datasets converted before it existed.
         from .lancedb_dataset import is_lance_dataset  # noqa: PLC0415 - keeps av/lancedb off the hot path
 
         if is_lance_dataset(repo_id, str(root) if root is not None else None, self.revision):
-            from .storage_backend import LanceStorageBackend  # noqa: PLC0415 - optional lancedb extra
+            from .storage_backend import BackendDatasetReader, LanceStorageBackend  # noqa: PLC0415
 
             backend = LanceStorageBackend(
                 repo_id=repo_id,
@@ -249,14 +246,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 return_uint8=return_uint8,
                 depth_output_unit=depth_output_unit,
             )
-            # The backend materializes the standard `meta/` tree, so metadata stays
-            # format-independent (the same LeRobotDatasetMetadata as the parquet path).
             self.meta = backend.meta
             self.root = backend.root
             self.revision = backend.meta.revision
             self.episodes = backend.episodes
             self.image_transforms = image_transforms
-            self.reader = DatasetReader(
+            self.reader = BackendDatasetReader(
+                backend=backend,
                 meta=self.meta,
                 root=self.root,
                 episodes=self.episodes,
@@ -266,7 +262,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 image_transforms=image_transforms,
                 return_uint8=return_uint8,
                 depth_output_unit=depth_output_unit,
-                backend=backend,
             )
             self.writer = None
             self._is_finalized = False
@@ -566,18 +561,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         reader = self._ensure_reader()
         if reader.hf_dataset is None:
-            # One-shot load after finalize() (no-op when a storage backend is set)
+            # One-shot load after finalize()
             reader.load_and_activate()
         return reader.get_item(idx)
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
-        """Batched fetch used by PyTorch's DataLoader (auto-collation path).
-
-        Delegates a whole batch of indices to the reader/backend in one call, so a
-        columnar backend (e.g. Lance) does a single batched read per batch instead
-        of one read per index. The Parquet/MP4 backend falls back to per-item reads
-        with identical results.
-        """
+        """Batched fetch used by PyTorch's DataLoader: one reader call per batch,
+        so backends with a batched read primitive serve it in a single fetch."""
         if self.writer is not None and not self._is_finalized:
             raise RuntimeError(
                 "Cannot read from a dataset that is being recorded. Call finalize() first, then access items."

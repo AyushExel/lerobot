@@ -60,7 +60,6 @@ class DatasetReader:
         image_transforms: Callable | None,
         return_uint8: bool = False,
         depth_output_unit: str = DEFAULT_DEPTH_UNIT,
-        backend=None,
     ):
         """Initialize the reader with metadata, filtering, and transform config.
 
@@ -83,12 +82,6 @@ class DatasetReader:
             depth_output_unit: Physical unit depth maps are dequantized to
                 (``"m"`` or ``"mm"``). Defaults to ``"mm"``.
         """
-        # When a storage backend is provided (e.g. Lance), it owns retrieval and the
-        # format-independent semantics that are cheapest to apply during its own
-        # batched read; the reader just delegates get_item(s) to it. The Parquet/MP4
-        # path leaves this None and uses hf_dataset below.
-        self._backend = backend
-
         self._meta = meta
         self.root = root
         self.episodes = resolve_episode_indices(episodes, meta.total_episodes)
@@ -126,8 +119,6 @@ class DatasetReader:
         if image_transforms is not None and not callable(image_transforms):
             raise TypeError("image_transforms must be callable or None.")
         self._image_transforms = image_transforms
-        if self._backend is not None:
-            self._backend.image_transforms = image_transforms
 
     def clear_image_transforms(self) -> None:
         """Remove the transform applied to visual observations."""
@@ -148,8 +139,6 @@ class DatasetReader:
 
     def load_and_activate(self) -> None:
         """Load HF dataset from disk and build index mapping. Call after data is on disk."""
-        if self._backend is not None:
-            return
         self.hf_dataset = self._load_hf_dataset()
         self._build_index_mapping()
 
@@ -163,15 +152,11 @@ class DatasetReader:
     @property
     def absolute_to_relative_idx(self) -> dict[int, int] | None:
         """Mapping from absolute frame indices to relative row positions (episode-filtered only)."""
-        if self._backend is not None:
-            return self._backend.absolute_to_relative_idx
         return self._absolute_to_relative_idx
 
     @property
     def num_frames(self) -> int:
         """Number of frames in selected episodes."""
-        if self._backend is not None:
-            return self._backend.num_frames
         if self.episodes is not None and self.hf_dataset is not None:
             return len(self.hf_dataset)
         return self._meta.total_frames
@@ -179,8 +164,6 @@ class DatasetReader:
     @property
     def num_episodes(self) -> int:
         """Number of episodes selected."""
-        if self._backend is not None:
-            return self._backend.num_episodes
         return len(self.episodes) if self.episodes is not None else self._meta.total_episodes
 
     def _load_hf_dataset(self) -> datasets.Dataset:
@@ -357,26 +340,17 @@ class DatasetReader:
             return dict(f.result() for f in futures)
 
     def get_items(self, indices: list[int]) -> list[dict]:
-        """Batched read for a list of relative indices — the perf-critical path.
-
-        A columnar/batched backend (Lance) turns the whole batch into a single
-        read here. The Parquet/MP4 path has no batched primitive, so it falls back
-        to per-item ``get_item``; behaviour is identical, only the number of reads
-        differs.
-        """
-        if self._backend is not None:
-            return self._backend.get_items(indices)
+        """Batched read for a list of relative indices. Storage backends with a
+        batched primitive override this; the Parquet/MP4 path reads per item."""
         return [self.get_item(idx) for idx in indices]
 
     def get_item(self, idx) -> dict:
-        """Core __getitem__ logic. Assumes hf_dataset is loaded (or a backend is set).
+        """Core __getitem__ logic. Assumes hf_dataset is loaded.
 
         ``idx`` is a *relative* index into the (possibly episode-filtered)
         HF dataset, **not** the absolute frame index stored in the ``index``
         column.  The absolute index is retrieved from the row itself.
         """
-        if self._backend is not None:
-            return self._backend.get_item(idx)
         item = self.hf_dataset[idx]
         ep_idx = item["episode_index"].item()
         abs_idx = item["index"].item()

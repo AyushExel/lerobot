@@ -312,17 +312,12 @@ def _storage_format_from_info(info_file: Path) -> str | None:
 def is_lance_dataset(
     repo_id: str | None = None, root: str | Path | None = None, revision: str | None = None
 ) -> bool:
-    """True if the dataset's storage format is Lance.
-
-    Resolution order: the ``storage_format`` field in LeRobot metadata decides when
-    present; layout detection is only a fallback for datasets converted before the
-    field existed. Datasets without either continue to the Parquet/MP4 backend.
-    """
+    """True if the dataset's storage format is Lance: metadata's ``storage_format``
+    field decides when present; layout detection is only a legacy fallback."""
     if root is None and repo_id is None:
         return False
     if root is not None and _is_remote_uri(root):
-        # Object-store URIs are read in place; only the Lance backend serves them.
-        return True
+        return True  # object-store URIs are only served by the Lance backend
     local_root = Path(root) if root is not None else HF_LEROBOT_HOME / repo_id
     fmt = _storage_format_from_info(local_root / "meta" / "info.json")
     if fmt is not None:
@@ -330,14 +325,11 @@ def is_lance_dataset(
     if (local_root / f"{FRAMES_TABLE}.lance").exists():
         return True
     if (local_root / "meta" / "info.json").exists() and (local_root / "data").exists():
-        # A complete local parquet/MP4 layout: definitively not Lance, skip the Hub
-        # lookups below. (A Lance dataset's local cache holds `meta/` but never `data/`.)
-        return False
+        return False  # complete local parquet/MP4 layout, skip the Hub lookups
     if repo_id is None:
         return False
-    # No decisive local copy: read the Hub metadata. Every backend needs info.json
-    # anyway and this lands in the same cache the metadata loader downloads into,
-    # so the Parquet path pays no extra request.
+    # Hub info.json lands in the cache the metadata loader also uses, so the
+    # parquet path pays no extra request.
     try:
         info_file = huggingface_hub.hf_hub_download(
             repo_id,
@@ -473,7 +465,6 @@ class LanceDBDataset(torch.utils.data.Dataset):
         self.return_uint8 = return_uint8
 
         if episode_filter is not None:
-            # Purely metadata-level, so the semantics match LeRobotDataset exactly.
             resolved = self.meta.filter_episodes(episode_filter, candidates=episodes)
             if not resolved:
                 raise ValueError(
@@ -640,12 +631,9 @@ class LanceDBDataset(torch.utils.data.Dataset):
         return self.get_items([idx])[0]
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
-        # PyTorch's DataLoader fetcher calls __getitems__ when present; this is the
-        # StorageBackend batched-read hook (== get_items) under the LeRobotDataset seam.
         return self.get_items(indices)
 
     def get_item(self, idx: int) -> dict:
-        """StorageBackend single-row read (delegates to the batched path)."""
         return self.get_items([idx])[0]
 
     def get_items(self, indices: list[int]) -> list[dict]:

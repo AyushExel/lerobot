@@ -15,17 +15,10 @@
 # limitations under the License.
 """Storage backend seam for LeRobotDataset.
 
-`LeRobotDataset` is the single public dataset class; the on-disk/remote format
-(Parquet/MP4 today, Lance here, others later) is a `StorageBackend` selected
-behind `DatasetReader`. `DatasetReader` keeps the format-independent LeRobot
-semantics (episode handling, delta timestamps, transforms, task resolution, the
-final sample structure); the backend only retrieves the underlying data.
+`LeRobotDataset` stays the single public dataset class; the storage format
+(Parquet/MP4, Lance, ...) plugs in as a `StorageBackend` behind the reader:
 
-The one perf-critical contract is `get_items`: a batch of indices resolves to a
-single batched read, so backends with columnar/batched access (Lance) keep that
-advantage under a standard PyTorch DataLoader:
-
-    DataLoader -> LeRobotDataset.__getitems__ -> DatasetReader.get_items -> backend.get_items
+    DataLoader -> LeRobotDataset.__getitems__ -> reader.get_items -> backend.get_items
 """
 
 from __future__ import annotations
@@ -33,16 +26,15 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Protocol, runtime_checkable
 
+from .dataset_reader import DatasetReader
+
 
 @runtime_checkable
 class StorageBackend(Protocol):
-    """Retrieval interface a storage format implements to plug in under LeRobotDataset.
+    """What a storage format implements to plug in under LeRobotDataset.
 
-    A backend owns nothing LeRobot-semantic; it returns fully-built item dicts for
-    a batch of relative indices (the reader's format-independent layer wraps it).
-    Kept deliberately small — exactly what DatasetReader delegates — so a new format
-    is "implement a backend", not "add a public Dataset class and branches through
-    the codebase".
+    A backend returns fully-built item dicts for relative indices; everything
+    format-independent stays in the reader/metadata layer.
     """
 
     image_transforms: Callable | None
@@ -54,23 +46,58 @@ class StorageBackend(Protocol):
     def num_episodes(self) -> int: ...
 
     @property
-    def absolute_to_relative_idx(self) -> dict[int, int] | None:
-        """Absolute frame index -> relative row position; None unless episode-filtered."""
-        ...
+    def absolute_to_relative_idx(self) -> dict[int, int] | None: ...
 
-    def get_item(self, idx: int) -> dict:
-        """Single-row read (typically get_items([idx])[0])."""
-        ...
+    def get_item(self, idx: int) -> dict: ...
 
     def get_items(self, indices: list[int]) -> list[dict]:
-        """Batched read — the perf-critical path. One batched fetch per call, not a
-        loop of per-item reads, so columnar backends keep their batching win."""
+        """Batched read — the perf-critical path: one fetch per call, not per item."""
         ...
 
 
-# The Lance backend is the current map-style reader; it already satisfies the
-# StorageBackend contract (get_item/get_items + the metadata properties). Import
-# is guarded so `storage_backend` stays importable without the optional lancedb dep.
+class BackendDatasetReader(DatasetReader):
+    """DatasetReader whose retrieval is served by a StorageBackend.
+
+    The backend opens its own tables lazily per worker, so there is nothing to
+    load; ``hf_dataset`` stays None.
+    """
+
+    def __init__(self, backend: StorageBackend, **kwargs):
+        super().__init__(**kwargs)
+        self._backend = backend
+
+    def try_load(self) -> bool:
+        return True
+
+    def load_and_activate(self) -> None:
+        pass
+
+    @property
+    def num_frames(self) -> int:
+        return self._backend.num_frames
+
+    @property
+    def num_episodes(self) -> int:
+        return self._backend.num_episodes
+
+    @property
+    def absolute_to_relative_idx(self) -> dict[int, int] | None:
+        return self._backend.absolute_to_relative_idx
+
+    def set_image_transforms(self, image_transforms: Callable | None) -> None:
+        super().set_image_transforms(image_transforms)
+        self._backend.image_transforms = image_transforms
+
+    def clear_image_transforms(self) -> None:
+        self.set_image_transforms(None)
+
+    def get_item(self, idx: int) -> dict:
+        return self._backend.get_item(idx)
+
+    def get_items(self, indices: list[int]) -> list[dict]:
+        return self._backend.get_items(indices)
+
+
 try:
     from .lancedb_dataset import LanceDBDataset as LanceStorageBackend  # noqa: F401
 except Exception:  # pragma: no cover - lancedb is an optional extra
