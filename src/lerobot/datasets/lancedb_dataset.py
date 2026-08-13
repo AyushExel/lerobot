@@ -253,7 +253,7 @@ def _storage_options(db_uri: str, storage_options: dict | None, revision: str | 
                 options["token"] = token
         if revision and "revision" not in options:
             options["revision"] = revision
-    return options
+    return {key: value for key, value in options.items() if value is not None}
 
 
 def _connect(db_uri: str, storage_options: dict | None, revision: str | None = None):
@@ -348,11 +348,12 @@ def lance_metadata(
     )
 
 
-class LanceDBDataset(torch.utils.data.Dataset):
-    """Map-style dataset over a Lance-backed LeRobot dataset.
+class LanceStorageBackend:
+    """Internal Lance storage backend for :class:`LeRobotDataset`.
 
-    Returns the same item dict as :class:`LeRobotDataset` and satisfies the same
-    duck-typed contract.
+    Not a public dataset class: it plugs in behind ``DatasetReader`` (selected
+    from metadata's ``storage_format``) and serves batched reads via
+    ``get_items``, returning the same item dicts as the Parquet/MP4 path.
 
     Args:
         repo_id: Hub dataset repo; tables stream over ``hf://``, only ``meta/`` downloads.
@@ -395,34 +396,38 @@ class LanceDBDataset(torch.utils.data.Dataset):
         token: str | bool | None = None,
         force_cache_sync: bool = False,
     ):
-        super().__init__()
         require_package("lancedb", extra="lancedb")
         if repo_id is None and root is None:
             raise ValueError("Provide `repo_id`, `root`, or both.")
 
         self.repo_id = repo_id
         self.tolerance_s = tolerance_s
-        if isinstance(token, str):
+        if isinstance(token, str) or token is False:
+            # An explicit string token reaches the object store; token=False pins the
+            # entry so no ambient token is injected (None values are dropped later).
             storage_options = {**(storage_options or {})}
-            storage_options.setdefault("token", token)
+            storage_options.setdefault("token", token if isinstance(token, str) else None)
         self._storage_options = storage_options
 
         self._db_uri, self.root = resolve_lance_root(
             repo_id, root, self._storage_options, revision, force_refresh=force_cache_sync
         )
 
+        # meta/ comes from the Hub only in the repo_id case; remote roots re-materialize
+        # it above and local roots read it in place, so there is nothing to sync there.
+        meta_from_hub = self._db_uri == f"hf://datasets/{repo_id}"
         self.meta = LeRobotDatasetMetadata(
             repo_id if repo_id is not None else str(self.root),
             root=self.root,
             revision=revision,
-            force_cache_sync=force_cache_sync,
+            force_cache_sync=force_cache_sync and meta_from_hub,
             token=token,
         )
         self._hub_revision = self.meta.revision if self._db_uri == f"hf://datasets/{repo_id}" else None
 
         if self.meta.image_keys:
             raise NotImplementedError(
-                f"Image-backed features are not supported by LanceDBDataset: {self.meta.image_keys}. "
+                f"Image-backed features are not supported by the Lance backend: {self.meta.image_keys}. "
                 "Re-encode them as video."
             )
         # Depth videos decode through pyav over the same prefetched sources.
@@ -600,15 +605,6 @@ class LanceDBDataset(torch.utils.data.Dataset):
     @property
     def fps(self) -> int:
         return self.meta.fps
-
-    def __len__(self) -> int:
-        return self.num_frames
-
-    def __getitem__(self, idx: int) -> dict:
-        return self.get_items([idx])[0]
-
-    def __getitems__(self, indices: list[int]) -> list[dict]:
-        return self.get_items(indices)
 
     def get_item(self, idx: int) -> dict:
         return self.get_items([idx])[0]

@@ -113,7 +113,20 @@ class BackendDatasetReader(DatasetReader):
         return self._backend.get_raw_item(idx)
 
 
-try:
-    from .lancedb_dataset import LanceDBDataset as LanceStorageBackend  # noqa: F401
-except Exception:  # pragma: no cover - lancedb is an optional extra
-    LanceStorageBackend = None  # type: ignore[assignment,misc]
+def make_storage_backend(storage_format: str, **kwargs) -> StorageBackend:
+    """Registry mapping a non-default ``storage_format`` to its backend implementation."""
+    if storage_format == "lance":
+        from .lancedb_dataset import LanceStorageBackend  # noqa: PLC0415 - optional lancedb extra
+
+        return LanceStorageBackend(**kwargs)
+    raise ValueError(f"No storage backend registered for storage_format={storage_format!r}.")
+
+
+def make_backend_metadata(storage_format: str, repo_id: str | None, root, revision: str | None):
+    """Metadata via the backend's transport (e.g. from an object-store URI the default
+    loader cannot reach). Returns None for the default Parquet/MP4 loader."""
+    if storage_format == "lance":
+        from .lancedb_dataset import lance_metadata  # noqa: PLC0415 - optional lancedb extra
+
+        return lance_metadata(repo_id, root, revision)
+    return None

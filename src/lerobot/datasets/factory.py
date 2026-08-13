@@ -28,6 +28,7 @@ from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
 from .dataset_metadata import LeRobotDatasetMetadata
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
+from .storage_backend import make_backend_metadata
 from .streaming_dataset import StreamingLeRobotDataset
 from .utils import resolve_episode_indices, resolve_storage_format
 
@@ -110,10 +111,9 @@ def _make_dataset_metadata(
     Non-default backends transport the standard ``meta/`` tree themselves (e.g.
     from an object-store URI ``LeRobotDatasetMetadata(root=...)`` cannot reach).
     """
-    if storage_format == "lance":
-        from .lancedb_dataset import lance_metadata  # noqa: PLC0415 - optional lancedb extra
-
-        return lance_metadata(repo_id, root, revision)
+    backend_meta = make_backend_metadata(storage_format, repo_id, root, revision)
+    if backend_meta is not None:
+        return backend_meta
     return LeRobotDatasetMetadata(repo_id, root=root, revision=revision, repo_type=repo_type)
 
 

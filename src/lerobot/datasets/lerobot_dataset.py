@@ -231,10 +231,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Storage-backend selection: metadata's `storage_format` field decides,
         # with layout detection as fallback for datasets converted before it existed.
         storage_format = resolve_storage_format(
-            repo_id, str(root) if root is not None else None, self.revision
+            repo_id, str(root) if root is not None else None, self.revision, token=token
         )
         if storage_format != "parquet":
-            from .storage_backend import BackendDatasetReader, LanceStorageBackend  # noqa: PLC0415
+            from .storage_backend import BackendDatasetReader, make_storage_backend  # noqa: PLC0415
 
             if video_backend is not None:
                 logger.warning(
@@ -242,7 +242,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     video_backend,
                     storage_format,
                 )
-            backend = LanceStorageBackend(
+            backend = make_storage_backend(
+                storage_format,
                 repo_id=repo_id,
                 root=root,
                 episodes=episodes,

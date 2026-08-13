@@ -569,7 +569,10 @@ def _declared_storage_format(info_file: Path) -> str | None:
 
 @lru_cache(maxsize=32)
 def resolve_storage_format(
-    repo_id: str | None = None, root: str | Path | None = None, revision: str | None = None
+    repo_id: str | None = None,
+    root: str | Path | None = None,
+    revision: str | None = None,
+    token: str | bool | None = None,
 ) -> str:
     """Storage format of a dataset: metadata's ``storage_format`` field decides when
     present; layout detection is only a fallback for datasets converted before the
@@ -599,6 +602,7 @@ def resolve_storage_format(
             repo_type="dataset",
             revision=revision,
             cache_dir=HF_LEROBOT_HUB_CACHE,
+            token=token,
         )
     except Exception:
         info_file = None
@@ -607,7 +611,9 @@ def resolve_storage_format(
         if fmt is not None:
             return fmt
     try:  # legacy Lance datasets (converted before `storage_format`): layout probe
-        paths = HfApi().get_paths_info(repo_id, ["frames.lance"], repo_type="dataset", revision=revision)
+        paths = HfApi(token=token).get_paths_info(
+            repo_id, ["frames.lance"], repo_type="dataset", revision=revision
+        )
     except Exception:
         return "parquet"
     return "lance" if paths else "parquet"
