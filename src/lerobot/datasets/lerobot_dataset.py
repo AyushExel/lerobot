@@ -571,11 +571,6 @@ class LeRobotDataset(torch.utils.data.Dataset):
         return reader.get_item(idx)
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
-        """Batched read, used by torch's ``DataLoader`` when a dataset defines it.
-
-        Storage backends can serve the whole batch in a single round trip; the
-        default parquet/mp4 pipeline reads item by item.
-        """
         if self._storage_backend is not None:
             return self._storage_backend.get_items(list(indices))
         return [self[idx] for idx in indices]

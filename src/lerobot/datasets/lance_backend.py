@@ -56,7 +56,7 @@ if TYPE_CHECKING or _lancedb_available:
 from .dataset_metadata import LeRobotDatasetMetadata
 from .depth_utils import dequantize_depth
 from .feature_utils import check_delta_timestamps, get_delta_indices
-from .storage import is_remote_uri, register_storage_backend
+from .storage import is_remote_uri
 from .video_utils import FrameTimestampError, decode_video_frames_pyav
 
 FRAMES_TABLE = "frames"
@@ -360,7 +360,6 @@ def resolve_lance_root(
     raise FileNotFoundError(f"No '{FRAMES_TABLE}.lance' table under {root_path}.")
 
 
-@register_storage_backend("lance")
 class LanceBackend:
     """Storage backend serving Lance-formatted LeRobot datasets.
 
@@ -948,3 +947,7 @@ class LanceBackend:
             f"  frames={self.num_frames},\n"
             f")"
         )
+
+
+# The class lerobot.datasets.storage instantiates for storage_format "lance".
+STORAGE_BACKEND = LanceBackend

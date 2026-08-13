@@ -13,15 +13,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pluggable storage backends for :class:`~lerobot.datasets.lerobot_dataset.LeRobotDataset`.
-
-``LeRobotDataset`` is the single public dataset class, whatever format a dataset
-is stored in. The default format — parquet tables plus mp4 videos — is built in.
-Alternative formats plug in underneath as *storage backends*: ``LeRobotDataset``
-reads ``storage_format`` from ``meta/info.json`` and delegates data access to the
-backend registered for that format, keeping metadata, episode selection, and item
-semantics identical across formats.
-"""
 
 from __future__ import annotations
 
@@ -35,16 +26,12 @@ if TYPE_CHECKING:
 
 DEFAULT_STORAGE_FORMAT = "parquet"
 
-# Formats shipped with lerobot, imported lazily so their optional dependencies
-# stay optional. Importing the module runs its ``@register_storage_backend``.
+# Supported non-default storage formats and the module implementing each.
+# Modules are imported lazily so their optional dependencies stay optional;
+# each must expose a ``STORAGE_BACKEND`` class implementing StorageBackend
+# (constructed with the keyword arguments listed on the protocol below) and a
+# ``localize_root(repo_id, root, revision)`` hook for object-store roots.
 _STORAGE_BACKEND_MODULES = {"lance": "lerobot.datasets.lance_backend"}
-
-# An object-store root (e.g. ``hf://datasets/{repo_id}``) carries no local ``meta/``
-# to read the format from before a backend localizes it. Lance is currently the
-# only URI-addressable format; revisit if another one appears.
-_REMOTE_ROOT_FORMAT = "lance"
-
-_STORAGE_BACKENDS: dict[str, Callable[..., StorageBackend]] = {}
 
 
 class StorageBackend(Protocol):
@@ -55,9 +42,11 @@ class StorageBackend(Protocol):
     padding masks, decoded video frames — identical to the default parquet/mp4
     pipeline's output. ``LeRobotDataset`` delegates ``__getitem__`` and
     ``__getitems__`` to it and keeps everything else (metadata, episode
-    selection, the public API). Batches go through :meth:`get_items` so a
-    backend can serve them in a single round trip. Instances must be picklable
-    so ``DataLoader`` workers can reopen their own connections.
+    selection, the public API). Instances are constructed with the keyword
+    arguments ``meta``, ``root``, ``episodes``, ``delta_timestamps``,
+    ``image_transforms``, ``tolerance_s``, ``revision``, ``return_uint8`` and
+    ``depth_output_unit``, and must be picklable so ``DataLoader`` workers can
+    reopen their own connections.
     """
 
     def __len__(self) -> int: ...
@@ -77,46 +66,35 @@ def is_remote_uri(root: str | Path) -> bool:
     return "://" in str(root)
 
 
-def register_storage_backend(storage_format: str) -> Callable:
-    """Class (or factory) decorator registering a backend for a storage format.
-
-    The registered callable is invoked with the keyword arguments ``meta``,
-    ``root``, ``episodes``, ``delta_timestamps``, ``image_transforms``,
-    ``tolerance_s``, ``revision``, ``return_uint8`` and ``depth_output_unit``,
-    and must return a :class:`StorageBackend`.
-    """
-
-    def decorator(factory: Callable[..., StorageBackend]) -> Callable[..., StorageBackend]:
-        _STORAGE_BACKENDS[storage_format] = factory
-        return factory
-
-    return decorator
-
-
 def _backend_module(storage_format: str):
     module_name = _STORAGE_BACKEND_MODULES.get(storage_format)
     if module_name is None:
         raise ValueError(
-            f"Unknown storage_format {storage_format!r}. Built-in formats: "
-            f"{[DEFAULT_STORAGE_FORMAT, *_STORAGE_BACKEND_MODULES]}. Third-party formats must be "
-            "registered with `register_storage_backend` before loading the dataset."
+            f"Unknown storage_format {storage_format!r}. Supported formats: "
+            f"{[DEFAULT_STORAGE_FORMAT, *_STORAGE_BACKEND_MODULES]}."
         )
     return importlib.import_module(module_name)
 
 
 def make_storage_backend(storage_format: str, **kwargs) -> StorageBackend:
-    """Instantiate the backend registered for ``storage_format``."""
-    if storage_format not in _STORAGE_BACKENDS:
-        _backend_module(storage_format)
-    return _STORAGE_BACKENDS[storage_format](**kwargs)
+    """Instantiate the backend class serving ``storage_format``."""
+    return _backend_module(storage_format).STORAGE_BACKEND(**kwargs)
 
 
 def localize_remote_root(repo_id: str | None, root: str | Path, revision: str | None = None) -> Path:
     """Materialize ``meta/`` for an object-store dataset and return the local dir holding it.
 
-    Data files are never downloaded — the storage backend reads them in place.
+    The format cannot be read from ``meta/info.json`` before ``meta/`` exists
+    locally, so each backend is asked in turn to recognize and localize the
+    root. Data files are never downloaded — backends read them in place.
     """
-    return _backend_module(_REMOTE_ROOT_FORMAT).localize_root(repo_id, root, revision)
+    errors = []
+    for storage_format in _STORAGE_BACKEND_MODULES:
+        try:
+            return _backend_module(storage_format).localize_root(repo_id, root, revision)
+        except FileNotFoundError as error:
+            errors.append(f"{storage_format}: {error}")
+    raise FileNotFoundError(f"No storage backend found a dataset at {str(root)!r}. Tried {errors}.")
 
 
 def load_dataset_metadata(
