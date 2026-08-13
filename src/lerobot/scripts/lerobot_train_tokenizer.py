@@ -209,11 +209,11 @@ def process_episode(args):
 
         for abs_idx in range(from_idx, to_idx):
             # map absolute index to relative index if needed
-            if dataset.absolute_to_relative_idx is not None:
-                if abs_idx not in dataset.absolute_to_relative_idx:
+            if dataset.reader._absolute_to_relative_idx is not None:
+                if abs_idx not in dataset.reader._absolute_to_relative_idx:
                     # this episode's frames aren't in the filtered dataset
                     return None
-                rel_idx = dataset.absolute_to_relative_idx[abs_idx]
+                rel_idx = dataset.reader._absolute_to_relative_idx[abs_idx]
             else:
                 rel_idx = abs_idx
 
