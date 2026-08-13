@@ -361,15 +361,15 @@ def test_dataloader_batch_is_one_backend_call(dataset_roots):
     ds = open_lance(lance_root)
     backend = ds.reader._backend
     calls: list[list[int]] = []
-    original = backend.get_items
-    backend.get_items = lambda indices: (calls.append(list(indices)) or original(indices))
+    original = backend.get_rows
+    backend.get_rows = lambda rows: (calls.append(list(rows)) or original(rows))
 
     loader = torch.utils.data.DataLoader(ds, batch_size=8, num_workers=0, shuffle=True, drop_last=True)
     n_batches = sum(1 for _ in loader)
 
     assert n_batches == len(ds) // 8
-    assert len(calls) == n_batches, "expected exactly one batched backend read per DataLoader batch"
-    assert all(len(indices) == 8 for indices in calls)
+    assert len(calls) == n_batches, "expected exactly one batched backend row read per DataLoader batch"
+    assert all(len(rows) == 8 for rows in calls)
 
 
 def test_facade_methods(dataset_roots):

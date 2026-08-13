@@ -242,31 +242,35 @@ class LeRobotDataset(torch.utils.data.Dataset):
                     video_backend,
                     storage_format,
                 )
+            # The backend only transports data; every semantic argument goes to the reader.
             backend = make_storage_backend(
                 storage_format,
                 repo_id=repo_id,
                 root=root,
-                episodes=episodes,
-                episode_filter=episode_filter,
-                image_transforms=image_transforms,
-                delta_timestamps=delta_timestamps,
-                tolerance_s=tolerance_s,
                 revision=revision,
-                return_uint8=return_uint8,
-                depth_output_unit=depth_output_unit,
                 token=token,
                 force_cache_sync=force_cache_sync,
             )
             self.meta = backend.meta
             self.root = backend.root
             self.revision = backend.meta.revision
-            self.episodes = backend.episodes
+            self.meta.rescale_depth_stats(self._depth_output_unit)
+
+            if episode_filter is not None:
+                resolved = self.meta.filter_episodes(episode_filter, candidates=episodes)
+                if not resolved:
+                    raise ValueError(
+                        "The episode filter did not match any episode. Make sure the filter and episodes list are valid and compatible."
+                    )
+                logger.info(f"The episode filter matched {len(resolved)} episode(s).")
+                episodes = resolved
+
             self.image_transforms = image_transforms
             self.reader = BackendDatasetReader(
                 backend=backend,
                 meta=self.meta,
                 root=self.root,
-                episodes=self.episodes,
+                episodes=episodes,
                 tolerance_s=tolerance_s,
                 video_backend=self._video_backend,
                 delta_timestamps=delta_timestamps,
@@ -274,6 +278,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 return_uint8=return_uint8,
                 depth_output_unit=depth_output_unit,
             )
+            self.episodes = self.reader.episodes
             self.writer = None
             self._is_finalized = False
             return

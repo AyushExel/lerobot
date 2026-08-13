@@ -19,24 +19,20 @@ from __future__ import annotations
 import bisect
 import io
 import json
-import logging
 import multiprocessing
 import os
 import re
 import shutil
-from collections import OrderedDict, defaultdict
-from collections.abc import Callable
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import av
-import datasets
 import huggingface_hub
 import numpy as np
 import torch
 
-from lerobot.configs.video import DEFAULT_DEPTH_UNIT, DepthEncoderConfig
 from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.utils.import_utils import _lancedb_available, require_package
 
@@ -45,9 +41,6 @@ if TYPE_CHECKING or _lancedb_available:
     from lancedb.permutation import Permutation
 
 from .dataset_metadata import LeRobotDatasetMetadata
-from .depth_utils import dequantize_depth
-from .feature_utils import check_delta_timestamps, get_delta_indices
-from .io_utils import hf_transform_to_torch
 from .utils import resolve_storage_format
 from .video_utils import FrameTimestampError, decode_video_frames_pyav
 
@@ -349,59 +342,41 @@ def lance_metadata(
 
 
 class LanceStorageBackend:
-    """Internal Lance storage backend for :class:`LeRobotDataset`.
+    """Lance retrieval backend for :class:`LeRobotDataset`.
 
-    Not a public dataset class: it plugs in behind ``DatasetReader`` (selected
-    from metadata's ``storage_format``) and serves batched reads via
-    ``get_items``, returning the same item dicts as the Parquet/MP4 path.
+    Holds no LeRobot semantics: it transports the standard ``meta/`` tree and
+    serves batched raw reads (``get_rows``/``get_column``/``get_video_frames``)
+    to :class:`~lerobot.datasets.storage_backend.BackendDatasetReader`, which
+    owns episode handling, delta windows, transforms, and sample assembly.
 
     Args:
         repo_id: Hub dataset repo; tables stream over ``hf://``, only ``meta/`` downloads.
         root: Local dir with ``meta/`` and ``.lance`` tables, or an object-store
             URI (``s3://...``) with the same layout. Local tables win when both given.
-        episodes: Episode indices to select. ``None`` means all.
-        episode_filter: Predicate over per-episode metadata rows used to select
-            episodes, as in :class:`LeRobotDataset`. Intersected with ``episodes``
-            when both are set.
-        image_transforms: Optional torchvision v2 transform for camera frames.
-        delta_timestamps: Feature key -> relative timestamp offsets (seconds), as
-            in :class:`LeRobotDataset`.
-        tolerance_s: Timestamp synchronization tolerance in seconds.
         revision: Hub revision for the ``meta/`` download.
-        return_uint8: Return RGB frames as raw uint8 instead of normalized float32.
         storage_options: Extra options forwarded to ``lancedb.connect``.
         token: Hub authentication token, as in :class:`LeRobotDataset`. A string
             token is also forwarded to the object store for ``hf://`` roots.
         force_cache_sync: Re-download / re-materialize the cached ``meta/`` tree.
         video_decoder_cache_size: Max decoders per worker (default 16, also
             bounded by a 2 GiB per-worker byte budget).
-        depth_output_unit: Unit depth features dequantize to (``'mm'`` or ``'m'``).
-            Depth decodes through pyav (16-bit planes torchcodec cannot emit).
     """
 
     def __init__(
         self,
         repo_id: str | None = None,
         root: str | Path | None = None,
-        episodes: list[int] | None = None,
-        episode_filter: Callable[[dict], bool] | None = None,
-        image_transforms: Callable | None = None,
-        delta_timestamps: dict[str, list[float]] | None = None,
-        tolerance_s: float = 1e-4,
         revision: str | None = None,
-        return_uint8: bool = False,
         storage_options: dict | None = None,
-        video_decoder_cache_size: int | None = None,
-        depth_output_unit: str = DEFAULT_DEPTH_UNIT,
         token: str | bool | None = None,
         force_cache_sync: bool = False,
+        video_decoder_cache_size: int | None = None,
     ):
         require_package("lancedb", extra="lancedb")
         if repo_id is None and root is None:
             raise ValueError("Provide `repo_id`, `root`, or both.")
 
         self.repo_id = repo_id
-        self.tolerance_s = tolerance_s
         if isinstance(token, str) or token is False:
             # An explicit string token reaches the object store; token=False pins the
             # entry so no ambient token is injected (None values are dropped later).
@@ -423,93 +398,26 @@ class LanceStorageBackend:
             force_cache_sync=force_cache_sync and meta_from_hub,
             token=token,
         )
-        self._hub_revision = self.meta.revision if self._db_uri == f"hf://datasets/{repo_id}" else None
+        self._hub_revision = self.meta.revision if meta_from_hub else None
 
         if self.meta.image_keys:
             raise NotImplementedError(
                 f"Image-backed features are not supported by the Lance backend: {self.meta.image_keys}. "
                 "Re-encode them as video."
             )
-        # Depth videos decode through pyav over the same prefetched sources.
-        self._depth_output_unit = depth_output_unit
-        if self.meta.depth_keys:
-            self.meta.rescale_depth_stats(self._depth_output_unit)
-        self._depth_encoder_configs = {
-            key: DepthEncoderConfig.from_video_info(self.meta.features[key].get("info"))
-            for key in self.meta.depth_keys
-        }
-        if image_transforms is not None and not callable(image_transforms):
-            raise TypeError("image_transforms must be callable or None.")
-        self.image_transforms = image_transforms
-        self.return_uint8 = return_uint8
 
-        if episode_filter is not None:
-            resolved = self.meta.filter_episodes(episode_filter, candidates=episodes)
-            if not resolved:
-                raise ValueError(
-                    "The episode filter did not match any episode. Make sure the filter and episodes list are valid and compatible."
-                )
-            logging.info(f"The episode filter matched {len(resolved)} episode(s).")
-            episodes = resolved
-        self.episodes = sorted(episodes) if episodes is not None else None
-        self.delta_indices = None
-        if delta_timestamps is not None:
-            check_delta_timestamps(delta_timestamps, self.meta.fps, tolerance_s)
-            self.delta_indices = get_delta_indices(delta_timestamps, self.meta.fps)
-
-        self._ep_from = self._episode_numpy("dataset_from_index", np.int64)
-        self._ep_to = self._episode_numpy("dataset_to_index", np.int64)
-        # episode ranges must tile [0, total_frames) exactly
-        if len(self._ep_from) and (
-            int(self._ep_from[0]) != 0
-            or int(self._ep_to[-1]) != self.meta.total_frames
-            or (self._ep_from[1:] != self._ep_to[:-1]).any()
-        ):
-            raise ValueError(
-                "Episode boundaries in meta do not tile [0, total_frames) contiguously; "
-                "the dataset metadata is inconsistent."
-            )
-
-        if self.episodes is not None:
-            self._rel_to_abs = np.concatenate(
-                [np.arange(self._ep_from[ep], self._ep_to[ep]) for ep in self.episodes]
-            )
-            self._absolute_to_relative_idx = {
-                int(abs_idx): rel_idx for rel_idx, abs_idx in enumerate(self._rel_to_abs)
-            }
-        else:
-            self._rel_to_abs = None
-            self._absolute_to_relative_idx = None
-
-        self._task_names = list(self.meta.tasks.index)
-
+        # Storage-side column mapping (dots -> underscores) and value decoding.
         self._tabular_keys = [
             key
             for key in self.meta.features
             if key not in self.meta.video_keys and key not in self.meta.image_keys
         ]
         self._fetch_columns = [to_lance_column(key) for key in self._tabular_keys]
-        self._feature_shapes = {
-            key: tuple(self.meta.features[key].get("shape") or ()) for key in self._tabular_keys
-        }
-        # String features pass through as python strings, language columns
-        # (list<struct>, lerobot#3467) as python lists of dicts, like upstream.
         self._string_keys = {
             key for key in self._tabular_keys if self.meta.features[key].get("dtype") == "string"
         }
         self._language_keys = {
             key for key in self._tabular_keys if self.meta.features[key].get("dtype") == "language"
-        }
-
-        # Which (chunk, file) mp4 holds each episode and where it starts inside
-        # it (episodes share files in v3.0; timestamps shift by from_timestamp).
-        self._video_locator = {
-            key: (
-                self._episode_numpy(f"videos/{key}/chunk_index", np.int64),
-                self._episode_numpy(f"videos/{key}/file_index", np.int64),
-                self._episode_numpy(f"videos/{key}/from_timestamp", np.float64),
-            )
-            for key in self.meta.video_keys
         }
 
         self._frames_table = None
@@ -519,14 +427,10 @@ class LanceStorageBackend:
         self._file_meta: OrderedDict[tuple, dict] = OrderedDict()
         self._prefetch_pool: ThreadPoolExecutor | None = None
         self._decode_pool: ThreadPoolExecutor | None = None
+        self._pending_prepare = None
         if video_decoder_cache_size is None:
             video_decoder_cache_size = 16
         self._decoder_cache = _VideoDecoderLRU(video_decoder_cache_size, byte_budget=2 << 30)  # 2GB cap
-
-    def _episode_numpy(self, name: str, dtype: type[np.generic]) -> np.ndarray:
-        # Read straight from the underlying Arrow column, not HF Dataset __getitem__
-        column = self.meta.episodes.data.column(name).to_numpy(zero_copy_only=False)
-        return column.astype(dtype, copy=False)
 
     def _ensure_open(self) -> None:
         if self._frames_perm is not None:
@@ -559,10 +463,15 @@ class LanceStorageBackend:
                 (row["video_key"], row["chunk_index"], row["file_index"]): row["_rowid"]
                 for row in index.to_pylist()
             }
+            episodes_data = self.meta.episodes.data
             referenced = {
                 (key, int(chunk), int(file))
-                for key, (chunks, files, _) in self._video_locator.items()
-                for chunk, file in zip(chunks, files, strict=True)
+                for key in self.meta.video_keys
+                for chunk, file in zip(
+                    episodes_data.column(f"videos/{key}/chunk_index").to_pylist(),
+                    episodes_data.column(f"videos/{key}/file_index").to_pylist(),
+                    strict=True,
+                )
             }
             missing = referenced - self._video_row_ids.keys()
             if missing:
@@ -581,193 +490,15 @@ class LanceStorageBackend:
         state["_file_meta"] = OrderedDict()
         state["_prefetch_pool"] = None
         state["_decode_pool"] = None
+        state["_pending_prepare"] = None
         state["_decoder_cache"] = _VideoDecoderLRU(
             self._decoder_cache.capacity, byte_budget=self._decoder_cache.byte_budget
         )
         return state
 
-    @property
-    def num_frames(self) -> int:
-        return len(self._rel_to_abs) if self._rel_to_abs is not None else self.meta.total_frames
-
-    @property
-    def num_episodes(self) -> int:
-        return len(self.episodes) if self.episodes is not None else self.meta.total_episodes
-
-    @property
-    def absolute_to_relative_idx(self) -> dict[int, int] | None:
-        return self._absolute_to_relative_idx
-
-    @property
-    def features(self) -> dict[str, dict]:
-        return self.meta.features
-
-    @property
-    def fps(self) -> int:
-        return self.meta.fps
-
-    def get_item(self, idx: int) -> dict:
-        return self.get_items([idx])[0]
-
-    def _abs_rows(self, indices: list[int] | None = None) -> list[int]:
-        """Absolute frames-table rows for relative indices (all rows when None)."""
-        if self.episodes is not None:
-            rows = self._rel_to_abs if indices is None else self._rel_to_abs[indices]
-            return [int(row) for row in rows]
-        if indices is None:
-            return list(range(self.meta.total_frames))
-        return [int(idx) for idx in indices]
-
-    def select_columns(self, column_names: str | list[str]) -> datasets.Dataset:
-        """Tabular column(s) as a ``datasets.Dataset``, as LeRobotDataset.select_columns."""
-        names = [column_names] if isinstance(column_names, str) else list(column_names)
-        unknown = [name for name in names if name not in self._tabular_keys]
-        if unknown:
-            raise ValueError(
-                f"Column(s) {unknown} are not tabular features of this dataset. "
-                f"The Lance backend serves tabular columns only; available: {self._tabular_keys}."
-            )
+    def get_rows(self, rows: list[int]) -> dict[str, np.ndarray | list]:
+        """One batched columnar read of the given absolute frame rows."""
         self._ensure_open()
-        columns = self._fetch_rows(self._abs_rows())
-        out = {}
-        for name in names:
-            data = columns[name]
-            shape = self._feature_shapes[name]
-            if isinstance(data, np.ndarray) and len(shape) > 1:
-                data = data.reshape(len(data), *shape)
-            out[name] = data.tolist() if isinstance(data, np.ndarray) else data
-        table = datasets.Dataset.from_dict(out)
-        table.set_transform(hf_transform_to_torch)
-        return table
-
-    def get_column(self, name: str) -> np.ndarray | list:
-        """One tabular column over the selected episodes (lists for string/language)."""
-        if name not in self._tabular_keys:
-            raise ValueError(
-                f"'{name}' is not a tabular feature of this dataset; available: {self._tabular_keys}."
-            )
-        self._ensure_open()
-        lance_name = self._fetch_columns[self._tabular_keys.index(name)]
-        perm = Permutation.identity(self._frames_table).select_columns([lance_name]).with_format("arrow")
-        array = perm.__getitems__(self._abs_rows()).column(lance_name)
-        if hasattr(array, "combine_chunks"):
-            array = array.combine_chunks()
-        if name in self._language_keys or name in self._string_keys:
-            return array.to_pylist()
-        if hasattr(array, "flatten") and hasattr(array.type, "value_type"):
-            values = array.flatten().to_numpy(zero_copy_only=False)
-            return values.reshape(len(array), -1)
-        return array.to_numpy(zero_copy_only=False)
-
-    def get_raw_item(self, idx: int) -> dict:
-        """Raw tabular row: no delta windows, video decoding, or image transforms."""
-        self._ensure_open()
-        columns = self._fetch_rows(self._abs_rows([idx]))
-        item = {}
-        for key in self._tabular_keys:
-            data = columns[key]
-            shape = self._feature_shapes[key]
-            if key in self._language_keys:
-                item[key] = data[0]
-            elif key in self._string_keys:
-                value = data[0]
-                item[key] = value if isinstance(value, str) or value is None else str(value)
-            elif getattr(data, "ndim", 1) > 1:
-                value = data[0]
-                if len(shape) > 1:
-                    value = value.reshape(shape)
-                item[key] = torch.from_numpy(value.copy())
-            else:
-                item[key] = torch.tensor(data[0])
-        return item
-
-    def get_items(self, indices: list[int]) -> list[dict]:
-        """Batched fetch: one deduplicated frames-table read and one blob fetch per batch."""
-        self._ensure_open()
-        plans = self._plan_batch(indices)
-        rows, row_pos = self._batch_rows(plans)
-
-        # Video prep (byte-index, header ranges, decoder creation, frame-window fetch)
-        # needs only the batch's files, so it overlaps the frames-table fetch. A wrong
-        # speculative range costs a re-fetch via the ranged-read fallback, never a wrong frame.
-        prepared_future = None
-        if self.meta.video_keys:
-            windows = self._plan_file_windows(plans)
-            prepared_future = self._prefetch_pool.submit(self._prepare_files, sorted(windows), windows)
-
-        columns = self._fetch_rows(rows)
-        items = [self._build_item(plan, columns, row_pos) for plan in plans]
-
-        if self.meta.video_keys:
-            decoded = self._decode_videos(plans, columns, row_pos, prepared_future.result())
-            for item, frames in zip(items, decoded, strict=True):
-                item.update(frames)
-        if self.image_transforms is not None:
-            for item in items:
-                for cam_key in self.meta.camera_keys:
-                    if cam_key in self.meta.depth_keys:
-                        continue
-                    item[cam_key] = self.image_transforms(item[cam_key])
-        return items
-
-    def _plan_file_windows(self, plans: list[dict]) -> dict[tuple, list[tuple[int, int]]]:
-        """Map each batch sample's video windows to (file key -> frame spans).
-
-        Positions come from episode metadata alone; stage 2 re-derives ranges
-        from real timestamps and fetches anything missed.
-        """
-        fps = float(self.meta.fps)
-        windows: dict[tuple, list[tuple[int, int]]] = {}
-        for plan in plans:
-            ep_idx = plan["ep_idx"]
-            for key in self.meta.video_keys:
-                file_key, span = self._planned_file_window(key, ep_idx, plan, fps)
-                windows.setdefault(file_key, []).append(span)
-        return windows
-
-    def _plan_batch(self, indices: list[int]) -> list[dict]:
-        """Resolve each sample to the absolute rows it needs and its padding masks."""
-        plans = []
-        for idx in indices:
-            abs_idx = self._resolve_abs_idx(idx)
-            ep_idx = self._episode_index_for_abs_idx(abs_idx)
-            start, end = self._episode_bounds(ep_idx)
-            plan = {"abs_idx": abs_idx, "ep_idx": ep_idx, "rows": {abs_idx}, "windows": {}, "padding": {}}
-            if self.delta_indices is not None:
-                for key, deltas in self.delta_indices.items():
-                    window = [min(max(abs_idx + delta, start), end - 1) for delta in deltas]
-                    plan["windows"][key] = window
-                    plan["rows"].update(window)
-                    plan["padding"][f"{key}_is_pad"] = torch.BoolTensor(
-                        [not (start <= abs_idx + delta < end) for delta in deltas]
-                    )
-            plans.append(plan)
-        return plans
-
-    def _resolve_abs_idx(self, idx: int) -> int:
-        return int(self._rel_to_abs[idx]) if self._rel_to_abs is not None else int(idx)
-
-    def _episode_index_for_abs_idx(self, abs_idx: int) -> int:
-        return int(np.searchsorted(self._ep_from, abs_idx, side="right") - 1)
-
-    def _episode_bounds(self, ep_idx: int) -> tuple[int, int]:
-        return int(self._ep_from[ep_idx]), int(self._ep_to[ep_idx])
-
-    def _batch_rows(self, plans: list[dict]) -> tuple[list[int], dict[int, int]]:
-        rows = sorted({row for plan in plans for row in plan["rows"]})
-        return rows, {row: pos for pos, row in enumerate(rows)}
-
-    def _planned_file_window(
-        self, key: str, ep_idx: int, plan: dict, fps: float
-    ) -> tuple[tuple[str, int, int], tuple[int, int]]:
-        ep_start, _ = self._episode_bounds(ep_idx)
-        _, _, from_ts_arr = self._video_locator[key]
-        window = plan["windows"].get(key, [plan["abs_idx"]])
-        base = round(float(from_ts_arr[ep_idx]) * fps) - ep_start
-        first = base + min(window) - (1 if key in self.meta.depth_keys else 0)
-        return self._video_file_key(key, ep_idx), (first, base + max(window))
-
-    def _fetch_rows(self, rows: list[int]) -> dict[str, np.ndarray]:
         batch = self._frames_perm.__getitems__(rows)
         columns = {}
         for key, lance_name in zip(self._tabular_keys, self._fetch_columns, strict=True):
@@ -791,62 +522,77 @@ class LanceStorageBackend:
                 columns[key] = array.to_numpy(zero_copy_only=False)
         return columns
 
-    def _decode_videos(
+    def get_column(self, name: str, rows: list[int] | None = None) -> np.ndarray | list:
+        """One tabular column (``rows=None`` means all rows), same value types as get_rows."""
+        if name not in self._tabular_keys:
+            raise ValueError(
+                f"'{name}' is not a tabular feature of this dataset; available: {self._tabular_keys}."
+            )
+        self._ensure_open()
+        if rows is None:
+            rows = list(range(self.meta.total_frames))
+        lance_name = self._fetch_columns[self._tabular_keys.index(name)]
+        perm = Permutation.identity(self._frames_table).select_columns([lance_name]).with_format("arrow")
+        array = perm.__getitems__(rows).column(lance_name)
+        if hasattr(array, "combine_chunks"):
+            array = array.combine_chunks()
+        if name in self._language_keys or name in self._string_keys:
+            return array.to_pylist()
+        if hasattr(array, "flatten") and hasattr(array.type, "value_type"):
+            values = array.flatten().to_numpy(zero_copy_only=False)
+            return values.reshape(len(array), -1)
+        return array.to_numpy(zero_copy_only=False)
+
+    def prefetch_videos(self, windows: dict[tuple, list[tuple[int, int]]]) -> None:
+        """Overlap hint: start fetching video bytes for the given (file -> frame spans)."""
+        self._ensure_open()
+        self._pending_prepare = self._prefetch_pool.submit(self._prepare_files, sorted(windows), windows)
+
+    def get_video_frames(
         self,
-        plans: list[dict],
-        columns: dict[str, np.ndarray],
-        row_pos: dict[int, int],
-        prepared: dict[tuple, tuple],
-    ) -> list[dict[str, torch.Tensor]]:
-        """Decode all camera frames a batch needs, one blob fetch + one decode pass per file."""
-        requests = self._build_video_requests(plans, columns["timestamp"], row_pos)
-        entries = prepared
+        requests: dict[tuple, list[tuple, list[float]]],
+        *,
+        tolerance_s: float,
+        return_uint8: bool,
+    ) -> dict:
+        """Batched decode: one blob fetch + one decode pass per video file.
 
-        results: list[dict[str, torch.Tensor]] = [{} for _ in plans]
+        Depth streams decode through pyav and are returned raw (undequantized),
+        mirroring upstream's ``decode_video_frames`` contract.
+        """
+        self._ensure_open()
+        pending, self._pending_prepare = self._pending_prepare, None
+        entries = pending.result() if pending is not None else self._prepare_files(sorted(requests))
 
-        def _decode_file(file_key: tuple, file_requests: list[tuple[int, list[float]]]) -> None:
+        results: dict = {}
+
+        def _decode_file(file_key: tuple, file_requests: list[tuple[tuple, list[float]]]) -> None:
             key, chunk_idx, file_idx = file_key
             decoder, source = entries[file_key]
             if key in self.meta.depth_keys:
-                for sample_idx, shifted_ts in file_requests:
-                    results[sample_idx][key] = self._decode_depth_window(source, shifted_ts, file_key)
+                for request_id, shifted_ts in file_requests:
+                    results[request_id] = self._decode_depth_window(source, shifted_ts, tolerance_s)
                 return
             fps = decoder.metadata.average_fps
-            for sample_idx, shifted_ts in file_requests:
+            for request_id, shifted_ts in file_requests:
                 indices = [round(ts * fps) for ts in shifted_ts]
                 batch = decoder.get_frames_at(indices=indices)
                 distance = (torch.tensor(shifted_ts, dtype=torch.float64) - batch.pts_seconds).abs()
-                if (distance >= self.tolerance_s).any():
+                if (distance >= tolerance_s).any():
                     raise FrameTimestampError(
-                        f"Query timestamps violate tolerance_s={self.tolerance_s} for video "
+                        f"Query timestamps violate tolerance_s={tolerance_s} for video "
                         f"'{key}' (chunk {chunk_idx}, file {file_idx}): queried {shifted_ts}, "
                         f"loaded {batch.pts_seconds.tolist()}."
                     )
                 frames = batch.data
-                if not self.return_uint8:
+                if not return_uint8:
                     frames = (frames / 255.0).type(torch.float32)
-                results[sample_idx][key] = frames.squeeze(0)
+                results[request_id] = frames
 
         futures = [self._decode_pool.submit(_decode_file, k, r) for k, r in requests.items()]
         for future in futures:
             future.result()
         return results
-
-    def _build_video_requests(
-        self,
-        plans: list[dict],
-        timestamps: np.ndarray,
-        row_pos: dict[int, int],
-    ) -> dict[tuple, list[tuple[int, list[float]]]]:
-        requests: dict[tuple, list[tuple[int, list[float]]]] = defaultdict(list)
-        for sample_idx, plan in enumerate(plans):
-            ep_idx = plan["ep_idx"]
-            for key in self.meta.video_keys:
-                window = plan["windows"].get(key, [plan["abs_idx"]])
-                requests[self._video_file_key(key, ep_idx)].append(
-                    (sample_idx, self._shifted_video_timestamps(key, ep_idx, window, timestamps, row_pos))
-                )
-        return requests
 
     def _prepare_files(
         self, file_keys: list[tuple], windows: dict[tuple, list[tuple[int, int]]] | None = None
@@ -920,37 +666,10 @@ class LanceStorageBackend:
             self._decoder_cache.put(key, (decoder, source), nbytes=source.buffered)
         return prepared
 
-    def _video_file_key(self, key: str, ep_idx: int) -> tuple[str, int, int]:
-        chunk_arr, file_arr, _ = self._video_locator[key]
-        return key, int(chunk_arr[ep_idx]), int(file_arr[ep_idx])
-
-    def _shifted_video_timestamps(
-        self,
-        key: str,
-        ep_idx: int,
-        window: list[int],
-        timestamps: np.ndarray,
-        row_pos: dict[int, int],
-    ) -> list[float]:
-        _, _, from_ts_arr = self._video_locator[key]
-        base = float(from_ts_arr[ep_idx])
-        return [base + float(timestamps[row_pos[row]]) for row in window]
-
-    def _decode_depth_window(self, source, shifted_ts: list[float], file_key: tuple) -> torch.Tensor:
+    def _decode_depth_window(self, source, shifted_ts: list[float], tolerance_s: float) -> torch.Tensor:
         """Decode one depth window with upstream's pyav decoder over our sparse source."""
         source.seek(0)
-        frames = decode_video_frames_pyav(
-            source, shifted_ts, self.tolerance_s, return_uint8=False, is_depth=True
-        )
-        config = self._depth_encoder_configs[file_key[0]]
-        return dequantize_depth(
-            frames,
-            depth_min=config.depth_min,
-            depth_max=config.depth_max,
-            shift=config.shift,
-            use_log=config.use_log,
-            output_unit=self._depth_output_unit,
-        ).squeeze(0)
+        return decode_video_frames_pyav(source, shifted_ts, tolerance_s, return_uint8=False, is_depth=True)
 
     def _fetch_spans(
         self, spans_by_key: dict[tuple, list[tuple[int, int]]], sources: dict[tuple, _SparseBlobSource]
@@ -1014,39 +733,10 @@ class LanceStorageBackend:
         slack = _RANGE_SLACK * 4 if key in self.meta.depth_keys else _RANGE_SLACK
         return int(kf_positions[start_idx]), min(end + slack, meta["file_size"])
 
-    def _build_item(self, plan: dict, columns: dict[str, np.ndarray], row_pos: dict[int, int]) -> dict:
-        base = row_pos[plan["abs_idx"]]
-        item = {}
-        for key in self._tabular_keys:
-            data = columns[key]
-            shape = self._feature_shapes[key]
-            if key in self._language_keys:
-                item[key] = data[base]
-            elif key in self._string_keys:
-                value = data[base]
-                item[key] = value if isinstance(value, str) or value is None else str(value)
-            elif key in plan["windows"]:
-                window = data[[row_pos[row] for row in plan["windows"][key]]]
-                if len(shape) > 1:
-                    window = window.reshape(len(window), *shape)
-                item[key] = torch.from_numpy(np.ascontiguousarray(window))
-            elif data.ndim > 1:
-                value = data[base]
-                if len(shape) > 1:
-                    value = value.reshape(shape)
-                item[key] = torch.from_numpy(value.copy())
-            else:
-                item[key] = torch.tensor(data[base])
-        item.update(plan["padding"])
-        item["task"] = self._task_names[int(item["task_index"].item())]
-        return item
-
     def __repr__(self) -> str:
         return (
             f"{self.__class__.__name__}(\n"
             f"  repo_id={self.repo_id},\n"
             f"  uri={self._db_uri},\n"
-            f"  episodes={self.num_episodes} selected / {self.meta.total_episodes} total,\n"
-            f"  frames={self.num_frames},\n"
-            f")"
+            f"  frames={self.meta.total_frames} / episodes={self.meta.total_episodes},\n"
         )
