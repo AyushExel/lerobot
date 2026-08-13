@@ -196,6 +196,11 @@ def test_storage_format_routing(video_dataset_roots):
     assert isinstance(lance_ds, LeRobotDataset)
     assert lance_ds.meta.storage_format == "lance"
     assert isinstance(lance_ds._storage_backend, LanceBackend)
+    # parquet-only surface reports absent instead of raising, so probes like
+    # lerobot_train's hasattr(ds, "hf_dataset") skip it gracefully
+    assert not hasattr(lance_ds, "hf_dataset")
+    with pytest.raises(NotImplementedError, match="push_to_hub"):
+        lance_ds.push_to_hub()
 
     parquet_ds = make(src_root)
     assert isinstance(parquet_ds, LeRobotDataset)

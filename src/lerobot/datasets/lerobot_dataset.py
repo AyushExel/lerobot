@@ -438,6 +438,13 @@ class LeRobotDataset(torch.utils.data.Dataset):
     @property
     def hf_dataset(self) -> datasets.Dataset:
         """The underlying Hugging Face Dataset object"""
+        if self._storage_backend is not None:
+            # AttributeError (not NotImplementedError) so ``hasattr(ds, "hf_dataset")``
+            # probes report False, as they did when this attribute did not exist.
+            raise AttributeError(
+                f"hf_dataset is not available for storage_format={self.meta.storage_format!r}: "
+                "data is read through its storage backend."
+            )
         self.reader = self._ensure_reader()
         if self.reader.hf_dataset is None:
             self.reader.load_and_activate()
@@ -654,6 +661,14 @@ class LeRobotDataset(torch.utils.data.Dataset):
             **card_kwargs: Additional keyword arguments forwarded to dataset card
                 creation.
         """
+        if self._storage_backend is not None:
+            # For a remote root, self.root is a localized meta-only cache: uploading
+            # it would publish a dataset whose metadata claims frames it doesn't hold.
+            raise NotImplementedError(
+                f"push_to_hub is not supported for storage_format={self.meta.storage_format!r}: "
+                "the data files are not managed by LeRobotDataset. Upload the dataset root "
+                "with huggingface_hub directly (or your format's own tooling) instead."
+            )
         ignore_patterns = ["images/"]
         if not push_videos:
             ignore_patterns.append("videos/")
