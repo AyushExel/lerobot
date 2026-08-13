@@ -325,3 +325,19 @@ def test_materialize_meta_rejects_escaping_paths(tmp_path):
         )
         with pytest.raises(ValueError, match="escapes the cache directory"):
             lance_module._materialize_meta(db, tmp_path / f"root_{i}")
+
+
+def test_stale_remote_meta_cache_gets_stamped(tmp_path):
+    """A meta/ cache materialized before storage_format existed must be stamped on
+    reuse, or LeRobotDataset would silently route the dataset to the parquet path."""
+    meta_dir = tmp_path / "meta"
+    meta_dir.mkdir()
+    (meta_dir / "info.json").write_text(json.dumps({"codebase_version": "v3.0"}))
+
+    lance_module._stamp_storage_format(meta_dir)
+    assert json.loads((meta_dir / "info.json").read_text())["storage_format"] == "lance"
+
+    # idempotent, and never overwrites an existing value
+    (meta_dir / "info.json").write_text(json.dumps({"storage_format": "other"}))
+    lance_module._stamp_storage_format(meta_dir)
+    assert json.loads((meta_dir / "info.json").read_text())["storage_format"] == "other"
