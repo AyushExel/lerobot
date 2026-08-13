@@ -173,6 +173,9 @@ class DatasetInfo:
     total_tasks: int = 0
 
     # Storage settings
+    # Which storage backend holds the data ("lance", ...). None means the default
+    # Parquet/MP4 layout; readers use this to select the backend from metadata alone.
+    storage_format: str | None = None
     chunks_size: int = field(default=DEFAULT_CHUNK_SIZE)
     data_files_size_in_mb: int = field(default=DEFAULT_DATA_FILE_SIZE_IN_MB)
     video_files_size_in_mb: int = field(default=DEFAULT_VIDEO_FILE_SIZE_IN_MB)
@@ -217,6 +220,8 @@ class DatasetInfo:
                 ft["shape"] = list(ft["shape"])
         if d.get("tools") is None:
             d.pop("tools", None)
+        if d.get("storage_format") is None:
+            d.pop("storage_format", None)  # Parquet/MP4 datasets keep a clean info.json
         return d
 
     @classmethod

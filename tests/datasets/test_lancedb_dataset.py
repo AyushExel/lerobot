@@ -294,3 +294,33 @@ def test_materialize_meta_rejects_escaping_paths(tmp_path):
         )
         with pytest.raises(ValueError, match="escapes the cache directory"):
             lancedb_module._materialize_meta(db, tmp_path / f"root_{i}")
+
+
+def test_storage_format_field_drives_selection(tmp_path):
+    """metadata's storage_format decides; layout detection is only a fallback."""
+    # Field says lance: selected even before any .lance table exists on disk.
+    declared = tmp_path / "declared_lance"
+    (declared / "meta").mkdir(parents=True)
+    (declared / "meta" / "info.json").write_text(json.dumps({"storage_format": "lance"}))
+    assert is_lance_dataset(root=str(declared)) is True
+
+    # Field says parquet: NOT selected, even with a frames.lance dir present.
+    declared_pq = tmp_path / "declared_parquet"
+    (declared_pq / "meta").mkdir(parents=True)
+    (declared_pq / "meta" / "info.json").write_text(json.dumps({"storage_format": "parquet"}))
+    (declared_pq / "frames.lance").mkdir()
+    assert is_lance_dataset(root=str(declared_pq)) is False
+
+    # No field (legacy convert): layout detection fallback still selects lance.
+    legacy = tmp_path / "legacy"
+    (legacy / "meta").mkdir(parents=True)
+    (legacy / "meta" / "info.json").write_text(json.dumps({"codebase_version": "v3.0"}))
+    (legacy / "frames.lance").mkdir()
+    assert is_lance_dataset(root=str(legacy)) is True
+
+    # No field, plain local parquet layout: not lance, and decided locally.
+    parquet = tmp_path / "parquet"
+    (parquet / "meta").mkdir(parents=True)
+    (parquet / "data").mkdir()
+    (parquet / "meta" / "info.json").write_text(json.dumps({"codebase_version": "v3.0"}))
+    assert is_lance_dataset(root=str(parquet)) is False
