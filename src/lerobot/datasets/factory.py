@@ -137,8 +137,9 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         storage_format = resolve_storage_format(cfg.dataset.repo_id, cfg.dataset.root, cfg.dataset.revision)
         if storage_format != "parquet" and cfg.dataset.streaming:
             raise ValueError(
-                f"dataset.streaming=True is not supported for storage_format={storage_format!r} "
-                "datasets: their backend already reads remotely without downloading data files."
+                "dataset.streaming=True selects StreamingLeRobotDataset, which reads the "
+                f"Parquet/MP4 layout, but this dataset's storage_format is {storage_format!r}. "
+                "Load it without streaming: its backend reads remotely (map-style, no download)."
             )
         ds_meta = _make_dataset_metadata(
             storage_format,
