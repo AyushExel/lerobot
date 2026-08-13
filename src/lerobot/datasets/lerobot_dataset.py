@@ -453,19 +453,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
     @property
     def hf_dataset(self) -> datasets.Dataset:
-        """The underlying Hugging Face Dataset object.
-
-        Only the Parquet/MP4 backend is backed by an HF dataset. AttributeError
-        (not another type) so ``hasattr(dataset, "hf_dataset")`` stays a valid probe.
-        """
+        """The underlying Hugging Face Dataset object"""
         self.reader = self._ensure_reader()
         if self.reader.hf_dataset is None:
             self.reader.load_and_activate()
-        if self.reader.hf_dataset is None:
-            raise AttributeError(
-                "hf_dataset is not available: this dataset is served by a storage backend. "
-                "Use select_columns(), get_column(), get_raw_item(), or __getitem__ instead."
-            )
         return self.reader.hf_dataset
 
     @property
@@ -475,10 +466,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         Non-None only for episode-filtered datasets where absolute indices
         (from metadata) differ from row positions in the loaded HF dataset.
         """
-        reader = self._ensure_reader()
-        if reader.hf_dataset is None:
-            reader.load_and_activate()
-        return reader.absolute_to_relative_idx
+        return self._ensure_reader().absolute_to_relative_idx
 
     # ── Writer-delegated methods ──────────────────────────────────────
 
@@ -584,11 +572,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if isinstance(idx, slice):
             return [self[item_idx] for item_idx in range(*idx.indices(len(self)))]
 
-        reader = self._ensure_reader()
-        if reader.hf_dataset is None:
-            # One-shot load after finalize()
-            reader.load_and_activate()
-        return reader.get_item(idx)
+        return self._ensure_reader().get_item(idx)
 
     def __getitems__(self, indices: list[int]) -> list[dict]:
         """Batched fetch used by PyTorch's DataLoader: one reader call per batch,
@@ -597,10 +581,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             raise RuntimeError(
                 "Cannot read from a dataset that is being recorded. Call finalize() first, then access items."
             )
-        reader = self._ensure_reader()
-        if reader.hf_dataset is None:
-            reader.load_and_activate()
-        return reader.get_items(indices)
+        return self._ensure_reader().get_items(indices)
 
     def select_columns(self, column_names: str | list[str]):
         """Select specific columns from the underlying dataset.
@@ -608,32 +589,15 @@ class LeRobotDataset(torch.utils.data.Dataset):
         Useful for extracting action sequences during replay without loading all features.
         Returns a ``datasets.Dataset`` containing only the requested columns.
         """
-        reader = self._ensure_reader()
-        if reader.hf_dataset is None:
-            reader.load_and_activate()
-        return reader.select_columns(column_names)
-
-    def get_column(self, name: str):
-        """One tabular column's values across the selected episodes.
-
-        Returns a numpy array (2D for vector features) or a list for string
-        features, without decoding any videos.
-        """
-        reader = self._ensure_reader()
-        if reader.hf_dataset is None:
-            reader.load_and_activate()
-        return reader.get_column(name)
+        return self.hf_dataset.select_columns(column_names)
 
     def get_raw_item(self, idx) -> dict:
         """Get a raw frame without image transforms applied.
 
-        Unlike ``__getitem__``, this returns the raw tabular row at the given
+        Unlike ``__getitem__``, this returns the raw HF dataset row at the given
         index with no delta-timestamp expansion, video decoding, or image transforms.
         """
-        reader = self._ensure_reader()
-        if reader.hf_dataset is None:
-            reader.load_and_activate()
-        return reader.get_raw_item(idx)
+        return self.hf_dataset[idx]
 
     def __repr__(self):
         feature_keys = list(self.features)

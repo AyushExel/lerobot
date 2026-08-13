@@ -522,27 +522,6 @@ class LanceStorageBackend:
                 columns[key] = array.to_numpy(zero_copy_only=False)
         return columns
 
-    def get_column(self, name: str, rows: list[int] | None = None) -> np.ndarray | list:
-        """One tabular column (``rows=None`` means all rows), same value types as get_rows."""
-        if name not in self._tabular_keys:
-            raise ValueError(
-                f"'{name}' is not a tabular feature of this dataset; available: {self._tabular_keys}."
-            )
-        self._ensure_open()
-        if rows is None:
-            rows = list(range(self.meta.total_frames))
-        lance_name = self._fetch_columns[self._tabular_keys.index(name)]
-        perm = Permutation.identity(self._frames_table).select_columns([lance_name]).with_format("arrow")
-        array = perm.__getitems__(rows).column(lance_name)
-        if hasattr(array, "combine_chunks"):
-            array = array.combine_chunks()
-        if name in self._language_keys or name in self._string_keys:
-            return array.to_pylist()
-        if hasattr(array, "flatten") and hasattr(array.type, "value_type"):
-            values = array.flatten().to_numpy(zero_copy_only=False)
-            return values.reshape(len(array), -1)
-        return array.to_numpy(zero_copy_only=False)
-
     def prefetch_videos(self, windows: dict[tuple, list[tuple[int, int]]]) -> None:
         """Overlap hint: start fetching video bytes for the given (file -> frame spans)."""
         self._ensure_open()

@@ -64,10 +64,6 @@ class StorageBackend(Protocol):
         """
         ...
 
-    def get_column(self, name: str, rows: list[int] | None = None) -> np.ndarray | list:
-        """One tabular column (``rows=None`` means all rows), same value types as get_rows."""
-        ...
-
     def get_video_frames(
         self,
         requests: dict[VideoFileKey, list[tuple[Hashable, list[float]]]],
@@ -169,7 +165,32 @@ class BackendDatasetReader(DatasetReader):
         return True
 
     def load_and_activate(self) -> None:
-        pass
+        """Materialize the tabular data as a real HF dataset (compatibility path).
+
+        The batched read path never calls this. It exists so existing consumers
+        of ``hf_dataset`` (replay's select_columns, visualization and stats
+        tools, ...) work unchanged on backend datasets: one batched read of the
+        same tabular table the Parquet path loads eagerly at init.
+        """
+        if self.hf_dataset is not None:
+            return
+        rows = (
+            [int(row) for row in self._rel_to_abs]
+            if self._rel_to_abs is not None
+            else list(range(self._meta.total_frames))
+        )
+        columns = self._backend.get_rows(rows)
+        out = {}
+        for key in self._tabular_keys:
+            data = columns[key]
+            shape = self._feature_shapes[key]
+            if isinstance(data, np.ndarray) and len(shape) > 1:
+                data = data.reshape(len(data), *shape)
+            # lists of 1-D numpy rows keep the storage dtype through Arrow
+            out[key] = list(data) if getattr(data, "ndim", 1) > 1 else data
+        view = datasets.Dataset.from_dict(out)
+        view.set_transform(hf_transform_to_torch)
+        self.hf_dataset = view
 
     # ── counts and index mapping ──────────────────────────────────────
 
@@ -328,42 +349,6 @@ class BackendDatasetReader(DatasetReader):
         item.update(plan["padding"])
         item["task"] = self._task_names[int(item["task_index"].item())]
         return item
-
-    # ── column-level facade methods ───────────────────────────────────
-
-    def _all_abs_rows(self) -> list[int] | None:
-        return [int(row) for row in self._rel_to_abs] if self._rel_to_abs is not None else None
-
-    def select_columns(self, column_names: str | list[str]) -> datasets.Dataset:
-        names = [column_names] if isinstance(column_names, str) else list(column_names)
-        unknown = [name for name in names if name not in self._tabular_keys]
-        if unknown:
-            raise ValueError(
-                f"Column(s) {unknown} are not tabular features of this dataset. "
-                f"Storage backends serve tabular columns only; available: {self._tabular_keys}."
-            )
-        rows = self._all_abs_rows()
-        out = {}
-        for name in names:
-            data = self._backend.get_column(name, rows=rows)
-            shape = self._feature_shapes[name]
-            if isinstance(data, np.ndarray) and len(shape) > 1:
-                data = data.reshape(len(data), *shape)
-            out[name] = data.tolist() if isinstance(data, np.ndarray) else data
-        table = datasets.Dataset.from_dict(out)
-        table.set_transform(hf_transform_to_torch)
-        return table
-
-    def get_column(self, name: str) -> np.ndarray | list:
-        if name not in self._tabular_keys:
-            raise ValueError(
-                f"'{name}' is not a tabular feature of this dataset; available: {self._tabular_keys}."
-            )
-        return self._backend.get_column(name, rows=self._all_abs_rows())
-
-    def get_raw_item(self, idx) -> dict:
-        columns = self._backend.get_rows([self._resolve_abs_idx(idx)])
-        return {key: self._tabular_value(key, columns[key], 0) for key in self._tabular_keys}
 
 
 def make_storage_backend(storage_format: str, **kwargs) -> StorageBackend:

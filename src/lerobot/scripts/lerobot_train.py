@@ -40,7 +40,6 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from accelerate import Accelerator
 
-import numpy as np
 import torch
 from termcolor import colored
 from torch.optim import Optimizer
@@ -327,8 +326,8 @@ def make_dataloaders(
     eval_dataloader = None
     if eval_dataset is not None:
         eval_ds = eval_dataset
-        if cfg.max_eval_samples > 0 and hasattr(eval_dataset, "get_column"):
-            task_arr = np.asarray(eval_dataset.get_column("task_index"))
+        if cfg.max_eval_samples > 0 and hasattr(eval_dataset, "hf_dataset"):
+            task_arr = eval_dataset.hf_dataset.data.column("task_index").to_numpy()
             unique_tasks = sorted(set(task_arr.tolist()))
             per_task = max(1, cfg.max_eval_samples // len(unique_tasks))
             selected: list[int] = []

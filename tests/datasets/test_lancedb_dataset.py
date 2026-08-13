@@ -373,16 +373,19 @@ def test_dataloader_batch_is_one_backend_call(dataset_roots):
 
 
 def test_facade_methods(dataset_roots):
-    """The public LeRobotDataset surface works (or fails loudly) on the Lance backend."""
+    """hf_dataset-based facade methods work unchanged on the Lance backend.
+
+    The batched read path never builds hf_dataset; touching it materializes the
+    tabular view once, so replay (select_columns), visualization and stats
+    tools keep working with no per-consumer branches.
+    """
     src_root, lance_root = dataset_roots
     upstream = LeRobotDataset(DUMMY_REPO_ID, root=src_root)
     lance_ds = open_lance(lance_root)
 
-    # hf_dataset is inherently parquet-specific: AttributeError (so hasattr probes work)
-    assert hasattr(upstream, "hf_dataset")
-    assert not hasattr(lance_ds, "hf_dataset")
-    with pytest.raises(AttributeError, match="storage backend"):
-        _ = lance_ds.hf_dataset
+    # the hot path must not have materialized anything
+    _ = lance_ds[3]
+    assert lance_ds.reader.hf_dataset is None
 
     columns_lance = lance_ds.select_columns("state")
     columns_parquet = upstream.select_columns("state")
@@ -395,12 +398,16 @@ def test_facade_methods(dataset_roots):
             atol=0,
         )
 
+    # raw column access through the materialized view matches parquet
     assert np.array_equal(
-        np.asarray(lance_ds.get_column("task_index")), np.asarray(upstream.get_column("task_index"))
+        np.asarray(lance_ds.hf_dataset.data.column("task_index").to_numpy()),
+        np.asarray(upstream.hf_dataset.data.column("task_index").to_numpy()),
     )
+    filtered_lance = open_lance(lance_root, episodes=[1])
+    filtered_parquet = LeRobotDataset(DUMMY_REPO_ID, root=src_root, episodes=[1])
     assert np.array_equal(
-        np.asarray(open_lance(lance_root, episodes=[1]).get_column("index")),
-        np.asarray(LeRobotDataset(DUMMY_REPO_ID, root=src_root, episodes=[1]).get_column("index")),
+        np.asarray(filtered_lance.hf_dataset.data.column("index").to_numpy()),
+        np.asarray(filtered_parquet.hf_dataset.data.column("index").to_numpy()),
     )
 
     assert_items_equal(lance_ds.get_raw_item(33), upstream.get_raw_item(33))
