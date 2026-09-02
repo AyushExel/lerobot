@@ -33,6 +33,7 @@ import json
 from collections import OrderedDict, defaultdict
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -228,13 +229,13 @@ class LanceDatasetReader(BaseDatasetReader):
         column = self.meta.episodes.data.column(name).to_numpy(zero_copy_only=False)
         return column.astype(dtype, copy=False)
 
+    def _connect(self):
+        return _connect(self._db_uri, self._storage_options, revision=self._hub_revision, token=self._token)
+
     def _ensure_open(self) -> None:
         if self._frames_perm is not None:
             return
-        if self.meta.video_keys:
-            self._prefetch_pool = ThreadPoolExecutor(max_workers=1)
-            self._decode_pool = ThreadPoolExecutor(max_workers=16)
-        db = _connect(self._db_uri, self._storage_options, revision=self._hub_revision, token=self._token)
+        db = self._connect()
         table = db.open_table(FRAMES_TABLE)
         n_rows = table.count_rows()
         if n_rows != self.meta.total_frames:
@@ -242,40 +243,52 @@ class LanceDatasetReader(BaseDatasetReader):
                 f"frames table has {n_rows} rows but meta declares "
                 f"{self.meta.total_frames} frames; the dataset is truncated or corrupt."
             )
-        self._frames_perm = (
-            Permutation.identity(table).select_columns(self._fetch_columns).with_format("arrow")
-        )
+        frames_perm = Permutation.identity(table).select_columns(self._fetch_columns).with_format("arrow")
+        videos_table = None
         if self.meta.video_keys:
-            self._videos_table = db.open_table(VIDEOS_TABLE)
-            # future TODO: resolve row ids lazily per batch.
-            index = (
-                self._videos_table.search()
-                .select(["video_key", "chunk_index", "file_index"])
-                .with_row_id(True)
-                .to_arrow()
+            videos_table = db.open_table(VIDEOS_TABLE)
+            if self._video_row_ids is None:
+                self._video_row_ids = self._scan_video_row_ids(videos_table)
+            self._prefetch_pool = ThreadPoolExecutor(max_workers=1)
+            self._decode_pool = ThreadPoolExecutor(max_workers=16)
+        # Publish last: a failure above leaves the reader closed rather than half-open.
+        self._videos_table = videos_table
+        self._frames_perm = frames_perm
+
+    def _scan_video_row_ids(self, videos_table) -> dict[tuple, int]:
+        """Map every (video_key, chunk, file) to its videos-table row id, checking coverage."""
+        index = (
+            videos_table.search()
+            .select(["video_key", "chunk_index", "file_index"])
+            .with_row_id(True)
+            .to_arrow()
+        )
+        row_ids = {
+            (row["video_key"], row["chunk_index"], row["file_index"]): row["_rowid"]
+            for row in index.to_pylist()
+        }
+        referenced = {
+            (key, int(chunk), int(file))
+            for key, (chunks, files, _) in self._video_locator.items()
+            for chunk, file in zip(chunks, files, strict=True)
+        }
+        missing = referenced - row_ids.keys()
+        if missing:
+            raise ValueError(
+                f"videos table is missing {len(missing)} file(s) referenced by episode "
+                f"metadata, e.g. {sorted(missing)[:3]}. The dataset is incomplete or "
+                "was converted against different metadata."
             )
-            self._video_row_ids = {
-                (row["video_key"], row["chunk_index"], row["file_index"]): row["_rowid"]
-                for row in index.to_pylist()
-            }
-            referenced = {
-                (key, int(chunk), int(file))
-                for key, (chunks, files, _) in self._video_locator.items()
-                for chunk, file in zip(chunks, files, strict=True)
-            }
-            missing = referenced - self._video_row_ids.keys()
-            if missing:
-                raise ValueError(
-                    f"videos table is missing {len(missing)} file(s) referenced by episode "
-                    f"metadata, e.g. {sorted(missing)[:3]}. The dataset is incomplete or "
-                    "was converted against different metadata."
-                )
+        return row_ids
 
     def __getstate__(self) -> dict:
+        if self.meta.video_keys and self._video_row_ids is None:
+            # Resolve once here so DataLoader workers inherit the map instead of each
+            # rescanning the videos table.
+            self._video_row_ids = self._scan_video_row_ids(self._connect().open_table(VIDEOS_TABLE))
         state = self.__dict__.copy()
         state["_frames_perm"] = None
         state["_videos_table"] = None
-        state["_video_row_ids"] = None
         state["_file_meta"] = OrderedDict()
         state["_prefetch_pool"] = None
         state["_decode_pool"] = None
@@ -345,8 +358,8 @@ class LanceDatasetReader(BaseDatasetReader):
     def _plan_file_windows(self, plans: list[dict]) -> dict[tuple, list[tuple[int, int]]]:
         """Map each batch sample's video windows to (file key -> frame spans).
 
-        Positions come from episode metadata alone; stage 2 re-derives ranges
-        from real timestamps and fetches anything missed.
+        Positions come from episode metadata alone (constant fps); any range this
+        misses is fetched on demand by the sparse source.
         """
         fps = float(self.meta.fps)
         windows: dict[tuple, list[tuple[int, int]]] = {}
@@ -503,12 +516,10 @@ class LanceDatasetReader(BaseDatasetReader):
                 new_files.append(key)
 
         if new_files:
-            handles = self._videos_table.fetch_blob_files(
-                VIDEO_BLOB_COLUMN, [self._video_row_ids[key] for key in new_files]
-            )
+            # Blob handles only serve fallback reads, so they are resolved on first miss.
             sources = {
-                key: _SparseBlobSource(self._file_meta[key]["file_size"], handle)
-                for key, handle in zip(new_files, handles, strict=True)
+                key: _SparseBlobSource(self._file_meta[key]["file_size"], partial(self._blob_handle, key))
+                for key in new_files
             }
             spans_by_key: dict[tuple, list[tuple[int, int]]] = {}
             for key in new_files:
@@ -556,6 +567,9 @@ class LanceDatasetReader(BaseDatasetReader):
         for key, (decoder, source) in prepared.items():
             self._decoder_cache.put(key, (decoder, source), nbytes=source.buffered)
         return prepared
+
+    def _blob_handle(self, key: tuple):
+        return self._videos_table.fetch_blob_files(VIDEO_BLOB_COLUMN, [self._video_row_ids[key]])[0]
 
     def _video_file_key(self, key: str, ep_idx: int) -> tuple[str, int, int]:
         chunk_arr, file_arr, _ = self._video_locator[key]

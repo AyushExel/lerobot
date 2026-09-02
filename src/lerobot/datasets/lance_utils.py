@@ -113,12 +113,17 @@ def build_video_byte_index(path: str | Path) -> dict:
 
 
 class _SparseBlobSource(io.RawIOBase):
-    """Adapter between range fetches and the decoders' file API."""
+    """Adapter between range fetches and the decoders' file API.
+
+    ``fallback`` is a zero-argument callable returning the blob handle used for
+    reads outside the prefetched ranges; it is only called on the first miss.
+    """
 
     def __init__(self, size: int, fallback):
         super().__init__()
         self._size = size
         self._fallback = fallback
+        self._handle = None
         self._starts: list[int] = []
         self._chunks: list[bytes] = []
         self._pos = 0
@@ -188,7 +193,9 @@ class _SparseBlobSource(io.RawIOBase):
         next_index = bisect.bisect_right(self._starts, self._pos)
         if next_index < len(self._starts):
             want = min(want, self._starts[next_index] - self._pos)
-        data = self._fallback.read_range(self._pos, want)
+        if self._handle is None:
+            self._handle = self._fallback()
+        data = self._handle.read_range(self._pos, want)
         self.fallback_bytes += len(data)
         buffer[: len(data)] = data
         self._pos += len(data)
