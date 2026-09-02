@@ -126,9 +126,28 @@ class _SparseBlobSource(io.RawIOBase):
         self._handle = None
         self._starts: list[int] = []
         self._chunks: list[bytes] = []
+        self._pins: list[tuple[int, int]] = []
         self._pos = 0
         self.buffered = 0
         self.fallback_bytes = 0
+
+    def pin(self, start: int, end: int) -> None:
+        """Keep any buffered range overlapping [start, end) across :meth:`trim`."""
+        self._pins.append((start, end))
+
+    def trim(self) -> None:
+        """Drop buffered ranges that hold no pinned bytes (stale frame windows)."""
+        keep = [
+            i
+            for i, start in enumerate(self._starts)
+            if any(
+                start < pin_end and start + len(self._chunks[i]) > pin_start
+                for pin_start, pin_end in self._pins
+            )
+        ]
+        self._starts = [self._starts[i] for i in keep]
+        self._chunks = [self._chunks[i] for i in keep]
+        self.buffered = sum(len(chunk) for chunk in self._chunks)
 
     def add(self, offset: int, data: bytes) -> None:
         end = offset + len(data)
@@ -204,10 +223,12 @@ class _SparseBlobSource(io.RawIOBase):
 
 class _VideoDecoderLRU:
     """Per-worker LRU of torchcodec decoders keyed by (video_key, chunk, file).
-    eviction is bounded by ``byte_budget`` too, not just count.
+
+    Bounded by ``byte_budget`` (the bytes each entry is charged with) and,
+    if given, by ``capacity`` entries.
     """
 
-    def __init__(self, capacity: int, byte_budget: int | None = None):
+    def __init__(self, capacity: int | None, byte_budget: int | None = None):
         self.capacity = capacity
         self.byte_budget = byte_budget
         self._items: OrderedDict[tuple, tuple[object, int]] = OrderedDict()
@@ -227,7 +248,7 @@ class _VideoDecoderLRU:
         self._items.move_to_end(key)
         self._total_bytes += nbytes
         while len(self._items) > 1 and (
-            len(self._items) > self.capacity
+            (self.capacity is not None and len(self._items) > self.capacity)
             or (self.byte_budget is not None and self._total_bytes > self.byte_budget)
         ):
             _, (_, evicted_bytes) = self._items.popitem(last=False)

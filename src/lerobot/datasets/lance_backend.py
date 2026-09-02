@@ -73,6 +73,9 @@ from .lance_utils import (  # noqa: F401
 from .utils import resolve_episode_indices
 from .video_utils import FrameTimestampError, decode_video_frames_pyav
 
+# Per-worker memory budget for cached video decoders and their buffered bytes.
+_DECODER_CACHE_BYTES = 512 * 1024 * 1024
+
 
 class LanceDatasetReader(BaseDatasetReader):
     """Dataset reader serving Lance-formatted LeRobot datasets.
@@ -96,8 +99,10 @@ class LanceDatasetReader(BaseDatasetReader):
         depth_output_unit: Unit depth features dequantize to (``'mm'`` or ``'m'``).
             Depth decodes through pyav (16-bit planes torchcodec cannot emit).
         storage_options: Extra options forwarded to ``lancedb.connect``.
-        video_decoder_cache_size: Max decoders per worker (default 16, also
-            bounded by a 2 GiB per-worker byte budget).
+        video_decoder_cache_size: Optional hard cap on cached decoders per worker.
+            By default the cache is bounded only by a 512 MiB per-worker memory
+            budget covering each decoder's estimated memory plus its buffered
+            header and current-batch window bytes.
     """
 
     def __init__(
@@ -220,9 +225,7 @@ class LanceDatasetReader(BaseDatasetReader):
         self._file_meta: OrderedDict[tuple, dict] = OrderedDict()
         self._prefetch_pool: ThreadPoolExecutor | None = None
         self._decode_pool: ThreadPoolExecutor | None = None
-        if video_decoder_cache_size is None:
-            video_decoder_cache_size = 16
-        self._decoder_cache = _VideoDecoderLRU(video_decoder_cache_size, byte_budget=2 << 30)  # 2GB cap
+        self._decoder_cache = _VideoDecoderLRU(video_decoder_cache_size, byte_budget=_DECODER_CACHE_BYTES)
 
     def _episode_numpy(self, name: str, dtype: type[np.generic]) -> np.ndarray:
         # Read straight from the underlying Arrow column, not HF Dataset __getitem__
@@ -512,6 +515,8 @@ class LanceDatasetReader(BaseDatasetReader):
         for key in file_keys:
             if key in self._decoder_cache:
                 prepared[key] = self._decoder_cache.get(key)
+                # Keep only the pinned header bytes; this batch's windows are fetched below.
+                prepared[key][1].trim()
             else:
                 new_files.append(key)
 
@@ -535,6 +540,8 @@ class LanceDatasetReader(BaseDatasetReader):
                 if len(meta["kf_positions"]):
                     first_packet = int(meta["kf_positions"][0])
                     spans.append((first_packet, min(first_packet + _OPEN_PROBE_BYTES, meta["file_size"])))
+                for span in spans:
+                    sources[key].pin(*span)
                 spans_by_key[key] = spans
             self._fetch_spans(spans_by_key, sources)
 
@@ -565,8 +572,14 @@ class LanceDatasetReader(BaseDatasetReader):
 
         # Insert/refresh each file in the decoder cache.
         for key, (decoder, source) in prepared.items():
-            self._decoder_cache.put(key, (decoder, source), nbytes=source.buffered)
+            nbytes = source.buffered + (self._decoder_bytes(key[0]) if decoder is not None else 0)
+            self._decoder_cache.put(key, (decoder, source), nbytes=nbytes)
         return prepared
+
+    def _decoder_bytes(self, key: str) -> int:
+        # Measured torchcodec/ffmpeg footprint: ~6 MiB of context plus ~3 decoded RGB frames.
+        height, width = sorted(self.meta.features[key]["shape"])[-2:]
+        return 6 * 1024 * 1024 + 9 * height * width
 
     def _blob_handle(self, key: tuple):
         return self._videos_table.fetch_blob_files(VIDEO_BLOB_COLUMN, [self._video_row_ids[key]])[0]
